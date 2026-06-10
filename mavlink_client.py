@@ -228,6 +228,12 @@ def disarm():
         return
     from pymavlink import mavutil
     try:
+        # Erase FC logs to free storage — ENOSPC causes disarm to fail
+        _connection.mav.log_erase_send(
+            _connection.target_system,
+            _connection.target_component
+        )
+        time.sleep(1.0)
         # Switch to STABILIZE first — ArduPlane won't disarm in GUIDED if it thinks it's airborne
         _connection.mav.command_long_send(
             _connection.target_system,
