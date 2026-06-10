@@ -34,6 +34,13 @@ MAX_BB_HEIGHT = _cfg["tracking"]["max_bb_height"]
 MAIN_SIZES    = [tuple(s) for s in _cfg["camera"]["main_sizes"]]
 LORES_SIZES   = [tuple(s) for s in _cfg["camera"]["lores_sizes"]]
 
+_net_iface  = _cfg["network"]["interface"]
+_net        = _cfg["network"][_net_iface]
+BIND_IP     = _net["bind_ip"]
+_VIDEO_MODE = _cfg["network"].get("video_mode", "jpeg_udp")
+GCS_IP      = None   # learned dynamically from GCS heartbeat packets
+print(f"[NET] interface={_net_iface}  bind={BIND_IP}  gcs=<waiting for GCS hello>")
+
 # Shared frame buffer for WebRTC
 frame_buffer = webrtc_server.FrameBuffer()
 
@@ -79,6 +86,7 @@ _est_fps = 0.0
 # Thread sync for frame sharing between producer (reader) and consumers (MJPEG/WebRTC)
 frame_lock = Lock()
 frame_ready = Condition(frame_lock)
+state.frame_lock = frame_lock
 
 # ============ Camera/File Reader (unified) ============
 cap = None
@@ -183,7 +191,15 @@ def _restart_reader_live():
 
 # === MAVLink Setup ===
 import mavlink_client
-mavlink_client.connect()
+_mav = _cfg["mavlink"]
+mavlink_client.start_mavproxy(
+    pixhawk_port  = _mav["pixhawk_port"],
+    pixhawk_baud  = _mav["pixhawk_baud"],
+    gcs_port      = _mav["gcs_port"],
+    local_port    = _mav["local_port"],
+    extra_outputs = _mav.get("extra_outputs", []),
+)
+mavlink_client.connect(url=f"udpin:0.0.0.0:{_mav['local_port']}")
 
 # === Command-line arguments setup ===
 parser = argparse.ArgumentParser()
@@ -307,24 +323,8 @@ if SHOW_LOCAL:
     cv2.setMouseCallback("Tracker", draw_rectangle)
 
 
-import flask_app
-app = flask_app.create_app(state, create_csrt_tracker)
-
-# === Launch Flask in separate thread ===
-flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True))
-flask_thread.daemon = True
-flask_thread.start()
-
-# === WebRTC server (background thread) ===
-webrtc_thread = Thread(target=webrtc_server.start, args=(frame_buffer,), daemon=True)
-webrtc_thread.start()
-
 # === Helpers to cycle resolutions (LIVE mode only) ===
 def _cycle_main(delta):
-    """
-    Step the MAIN capture resolution up (+1) or down (-1) through MAIN_SIZES.
-    Restarts the live camera reader at the new resolution. Live mode only.
-    """
     global _main_idx, main_size
     _main_idx = (_main_idx + delta) % len(MAIN_SIZES)
     main_size = list(MAIN_SIZES[_main_idx])
@@ -332,14 +332,104 @@ def _cycle_main(delta):
     _restart_reader_live()
 
 def _cycle_lores(delta):
-    """
-    Step the LORES tracking resolution up (+1) or down (-1) through LORES_SIZES.
-    Takes effect on the next tracker initialization; does not restart the camera.
-    """
     global _lores_idx
     _lores_idx = (_lores_idx + delta) % len(LORES_SIZES)
     state.lores_size = list(LORES_SIZES[_lores_idx])
     print(f"[TRACK] LORES → {state.lores_size[0]}x{state.lores_size[1]}")
+
+
+import flask_app
+app = flask_app.create_app(
+    state, create_csrt_tracker,
+    cycle_main_fn      = _cycle_main if args.mode == 'live' else None,
+    cycle_lores_fn     = _cycle_lores,
+    launch_fn          = lambda v=None: mavlink_client.arm_and_set_guided() if (v is None or v) else mavlink_client.disarm(),
+    get_launch_state_fn= lambda: mavlink_client._launched,
+)
+
+# === Launch Flask in separate thread ===
+print(f"[Flask]  http://{BIND_IP}:5000")
+flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True))
+flask_thread.daemon = True
+flask_thread.start()
+
+# === Video stream (mode selected by config.toml video_mode) ===
+import socket as _socket
+import json as _json
+import requests as _req
+
+if _VIDEO_MODE == "webrtc":
+    print(f"[WebRTC] http://{BIND_IP}:8080")
+    webrtc_thread = Thread(target=webrtc_server.start, args=(frame_buffer,), daemon=True)
+    webrtc_thread.start()
+
+elif _VIDEO_MODE == "jpeg_udp":
+    _UDP_PORT     = _cfg["network"].get("gcs_udp_port", 5600)
+    _JPEG_QUALITY = _cfg["network"].get("gcs_jpeg_quality", 40)
+    _STREAM_WIDTH = _cfg["network"].get("gcs_stream_width", 640)
+    _udp_sock     = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    _udp_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_SNDBUF, 1 << 20)
+    _JPEG_PARAMS  = [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY]
+    _UDP_MAX      = 65400
+
+    def _udp_stream_worker():
+        last_gen = -1
+        _t0, _sent = time.time(), 0
+        print(f"[UDP]  stream worker ready — waiting for GCS to announce")
+        while True:
+            frame, gen = frame_buffer.get(last_gen=last_gen, timeout=0.1)
+            if frame is None or GCS_IP is None:
+                continue
+            last_gen = gen
+            _sent += 1
+            _now = time.time()
+            if _now - _t0 >= 5.0:
+                print(f"[UDP]  {_sent/(_now-_t0):.1f} fps ({_sent} frames) → {GCS_IP}")
+                _t0, _sent = _now, 0
+            h_f, w_f = frame.shape[:2]
+            if w_f > _STREAM_WIDTH:
+                scale = _STREAM_WIDTH / w_f
+                frame = cv2.resize(frame, (_STREAM_WIDTH, int(h_f * scale)), interpolation=cv2.INTER_LINEAR)
+            ok, buf = cv2.imencode('.jpg', frame, _JPEG_PARAMS)
+            if not ok:
+                continue
+            data = buf.tobytes()
+            if len(data) > _UDP_MAX:
+                continue
+            try:
+                _udp_sock.sendto(data, (GCS_IP, _UDP_PORT))
+            except Exception as e:
+                print(f"[UDP]  send error: {e}")
+
+    Thread(target=_udp_stream_worker, daemon=True).start()
+
+else:
+    print(f"[WARN] Unknown video_mode '{_VIDEO_MODE}' — no video stream started")
+
+# === UDP command channel — learns GCS IP from heartbeat, forwards commands to Flask ===
+_CMD_PORT = _cfg["network"].get("gcs_cmd_port", 5601)
+_cmd_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+_cmd_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+_cmd_sock.bind(('', _CMD_PORT))
+
+def _udp_cmd_listener():
+    global GCS_IP
+    print(f"[CMD]  listening for commands on UDP:{_CMD_PORT}")
+    while True:
+        try:
+            data, addr = _cmd_sock.recvfrom(4096)
+            if GCS_IP != addr[0]:
+                print(f"[NET]  GCS IP {'learned' if GCS_IP is None else 'updated'}: {addr[0]}")
+                GCS_IP = addr[0]
+            msg = _json.loads(data.decode())
+            ep  = msg.pop("endpoint", None)
+            if ep:
+                _req.post(f"http://127.0.0.1:5000/{ep}", data=msg, timeout=1)
+        except Exception as e:
+            if "timed out" not in str(e).lower():
+                print(f"[CMD]  {e}")
+
+Thread(target=_udp_cmd_listener, daemon=True).start()
 
 # === Main Loop (render & publish) ===
 while True:
@@ -416,7 +506,7 @@ while True:
                 yaw_err   =  norm_dx * math.radians(60)   # rad
                 pitch_err = -norm_dy * math.radians(45)   # rad
 
-                mavlink_client.send_vision_error(pitch_err, yaw_err)
+                mavlink_client.send_attitude_target(pitch, yaw)
 
 
                 # Box visuals
@@ -515,6 +605,7 @@ while True:
                 print(f"[PLAYBACK] Seek +5 s")
 
 # === Cleanup ===
+mavlink_client.disarm()
 cv2.destroyAllWindows()
 _stop_reader.set()
 if _reader_thread and _reader_thread.is_alive():

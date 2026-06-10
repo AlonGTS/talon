@@ -1,5 +1,5 @@
 [display]
-show_local = true  # true for playback/debug with monitor, false for headless flight
+show_local = false  # true for playback/debug with monitor, false for headless flight
 
 [tracking]
 max_bb_width = 120
@@ -52,7 +52,7 @@ video_mode           = "jpeg_udp"
 webrtc_bitrate_kbps  = 0   # 0 = unconstrained; set e.g. 800 for narrow RF links
 
 [network.wlan0]
-bind_ip = "192.168.1.28"
+bind_ip = "192.168.1.37"
 # gcs_ip no longer needed — Pi learns GCS IP dynamically from heartbeat packets
 
 [network.wlan1]
@@ -60,7 +60,7 @@ bind_ip = "192.168.10.2"
 gcs_ip  = "192.168.10.8"
 
 [mavlink]
-pixhawk_port  = "/dev/ttyACM0"
+pixhawk_port  = "/dev/ttyACM0"   # Matek F405 Wing — check with: ls /dev/ttyACM* /dev/ttyUSB*
 pixhawk_baud  = 115200
 gcs_ip        = "192.168.1.30"    # legacy field (kept for reference)
 gcs_port      = 14550

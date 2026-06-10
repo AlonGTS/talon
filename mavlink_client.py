@@ -95,6 +95,19 @@ def send_vision_error(pitch_err, yaw_err, is_tracking=False):
 # Connect
 # ---------------------------------------------------------------------------
 
+def _find_fc_port(configured):
+    import os, glob
+    if os.path.exists(configured):
+        return configured
+    for pattern in ("/dev/ttyACM*", "/dev/ttyUSB*"):
+        ports = sorted(glob.glob(pattern))
+        if ports:
+            print(f"[MAVProxy] {configured} not found, auto-detected {ports[0]}")
+            return ports[0]
+    print(f"[MAVProxy] WARNING: no FC port found, falling back to {configured}")
+    return configured
+
+
 def start_mavproxy(pixhawk_port="/dev/ttyACM0", pixhawk_baud=115200,
                    gcs_port=14550, local_port=14551,
                    extra_outputs=None):
@@ -106,6 +119,7 @@ def start_mavproxy(pixhawk_port="/dev/ttyACM0", pixhawk_baud=115200,
                    --out=udpout:<ip>:<gcs_port> added to the MAVProxy command.
     """
     global _mavproxy_proc
+    pixhawk_port = _find_fc_port(pixhawk_port)
     cmd = [
         "/home/mahat/webrtc_venv/bin/mavproxy.py",
         f"--master={pixhawk_port}",
@@ -208,14 +222,78 @@ _telem_thread.start()
 # Public API
 # ---------------------------------------------------------------------------
 
-def send_attitude(pitch, yaw):
-    """Push pitch/yaw commands via MAVLink RC override (units: radians)."""
+def disarm():
+    """Disarm the FC. Call on exit."""
     if not _enabled:
-        print(f"[DEBUG] Pitch: {math.degrees(pitch):.2f}deg, Yaw: {math.degrees(yaw):.2f}deg")
         return
+    from pymavlink import mavutil
     try:
-        pitch_pwm = int(1500 + pitch * 500)
-        yaw_pwm   = int(1500 + yaw   * 500)
-        print(f"[MAVLink] Sent pitch PWM: {pitch_pwm}, yaw PWM: {yaw_pwm}")
+        _connection.mav.command_long_send(
+            _connection.target_system,
+            _connection.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0,
+            0,      # 0 = disarm
+            21196,  # force disarm — bypasses in-air / safety checks
+            0, 0, 0, 0, 0
+        )
+        print("[MAVLink] DISARM command sent")
+        global _launched
+        _launched = False
     except Exception as e:
-        print(f"[MAVLink] Failed to send attitude: {e}")
+        print(f"[MAVLink] disarm failed: {e}")
+
+
+def arm_and_set_guided():
+    """Set GUIDED mode and arm the FC. Call once after connect()."""
+    if not _enabled:
+        print("[MAVLink] Not connected — skipping arm/GUIDED")
+        return
+    from pymavlink import mavutil
+    _connection.mav.command_long_send(
+        _connection.target_system,
+        _connection.target_component,
+        mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+        0,
+        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+        15,  # GUIDED mode number for ArduPlane
+        0, 0, 0, 0, 0
+    )
+    print("[MAVLink] GUIDED mode command sent")
+    time.sleep(0.5)
+    _connection.mav.command_long_send(
+        _connection.target_system,
+        _connection.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        0,
+        1,  # 1 = arm
+        0, 0, 0, 0, 0, 0
+    )
+    print("[MAVLink] ARM command sent")
+    global _launched
+    _launched = True
+
+
+def send_attitude_target(pitch, yaw, roll=0.0, thrust=0.5):
+    """Send SET_ATTITUDE_TARGET every frame. Units: radians. Call at ~10 Hz or faster."""
+    if not _enabled:
+        if DEBUG:
+            print(f"[DEBUG] pitch={math.degrees(pitch):.2f}° yaw={math.degrees(yaw):.2f}°")
+        return
+    from pymavlink.quaternion import QuaternionBase
+    try:
+        q = QuaternionBase([roll, pitch, yaw])
+        _connection.mav.set_attitude_target_send(
+            int(time.time() * 1000) & 0xFFFFFFFF,
+            _connection.target_system,
+            _connection.target_component,
+            0b00000111,        # ignore body rates, use quaternion + thrust
+            q,
+            0.0, 0.0, 0.0,    # body roll/pitch/yaw rates (ignored)
+            thrust
+        )
+        if DEBUG:
+            print(f"[MAVLink] SET_ATTITUDE_TARGET pitch={math.degrees(pitch):.2f}° "
+                  f"yaw={math.degrees(yaw):.2f}° thrust={thrust:.2f}")
+    except Exception as e:
+        print(f"[MAVLink] set_attitude_target failed: {e}")
