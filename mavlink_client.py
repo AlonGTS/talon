@@ -228,12 +228,15 @@ def disarm():
         return
     from pymavlink import mavutil
     try:
-        # Erase FC logs to free storage — ENOSPC causes disarm to fail
-        _connection.mav.log_erase_send(
+        # Disable logging — no SD card installed, ENOSPC blocks disarm
+        _connection.mav.param_set_send(
             _connection.target_system,
-            _connection.target_component
+            _connection.target_component,
+            b'LOG_BACKEND_TYPE',
+            0,
+            mavutil.mavlink.MAV_PARAM_TYPE_INT32
         )
-        time.sleep(1.0)
+        time.sleep(0.3)
         # Switch to STABILIZE first — ArduPlane won't disarm in GUIDED if it thinks it's airborne
         _connection.mav.command_long_send(
             _connection.target_system,
@@ -267,6 +270,15 @@ def arm_and_set_guided():
         print("[MAVLink] Not connected — skipping arm/GUIDED")
         return
     from pymavlink import mavutil
+    # Disable logging — no SD card, avoids ENOSPC blocking arm/disarm
+    _connection.mav.param_set_send(
+        _connection.target_system,
+        _connection.target_component,
+        b'LOG_BACKEND_TYPE',
+        0,
+        mavutil.mavlink.MAV_PARAM_TYPE_INT32
+    )
+    time.sleep(0.3)
     _connection.mav.command_long_send(
         _connection.target_system,
         _connection.target_component,
