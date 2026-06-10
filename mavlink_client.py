@@ -204,8 +204,12 @@ def _telemetry_reader():
             time.sleep(0.5)
             continue
         try:
-            msg = _connection.recv_match(type='ATTITUDE', blocking=True, timeout=1.0)
-            if msg and SHOW_TELEMETRY:
+            msg = _connection.recv_match(type=['ATTITUDE', 'STATUSTEXT'], blocking=True, timeout=1.0)
+            if msg is None:
+                continue
+            if msg.get_type() == 'STATUSTEXT':
+                print(f"[FC] {msg.text.strip()}")
+            elif SHOW_TELEMETRY:
                 import math as _math
                 print(f"[Telem] roll={_math.degrees(msg.roll):+.1f}°  "
                       f"pitch={_math.degrees(msg.pitch):+.1f}°  "
@@ -258,12 +262,12 @@ def disarm():
             0, 0, 0, 0, 0
         )
         time.sleep(0.5)
-        # Zero throttle via RC override so FC doesn't think it's flying
+        # Neutral all surfaces + zero throttle
         _connection.mav.rc_channels_override_send(
             _connection.target_system,
             _connection.target_component,
-            65535, 65535, 1000, 65535,   # ch1-4: ignore, ignore, throttle min, ignore
-            65535, 65535, 65535, 65535   # ch5-8: ignore
+            1500, 1500, 1000, 1500,   # roll, pitch, throttle, yaw → neutral/min
+            65535, 65535, 65535, 65535
         )
         time.sleep(1.0)
         _connection.mav.command_long_send(
@@ -275,10 +279,12 @@ def disarm():
             21196,  # force
             0, 0, 0, 0, 0
         )
-        print("[MAVLink] DISARM command sent")
+        time.sleep(0.5)
+        still_armed = _is_armed()
+        print(f"[MAVLink] DISARM {'succeeded' if not still_armed else 'FAILED — FC still armed'}")
         _launched = False
     except Exception as e:
-        print(f"[MAVLink] disarm failed: {e}")
+        print(f"[MAVLink] disarm error: {e}")
 
 
 def arm_and_set_guided():
