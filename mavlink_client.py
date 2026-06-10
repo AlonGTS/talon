@@ -223,14 +223,16 @@ _telem_thread.start()
 # ---------------------------------------------------------------------------
 
 def _is_armed():
-    """Return True if the FC heartbeat shows armed, False otherwise."""
-    try:
-        hb = _connection.recv_match(type='HEARTBEAT', blocking=True, timeout=2.0)
-        if hb:
-            from pymavlink import mavutil
-            return bool(hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
-    except Exception:
-        pass
+    """Return True if the FC heartbeat shows armed. Filters for FC sysid, not MAVProxy."""
+    from pymavlink import mavutil
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        try:
+            hb = _connection.recv_match(type='HEARTBEAT', blocking=True, timeout=1.0)
+            if hb and hb.get_srcSystem() == _connection.target_system:
+                return bool(hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+        except Exception:
+            pass
     return False
 
 
@@ -256,12 +258,20 @@ def disarm():
             0, 0, 0, 0, 0
         )
         time.sleep(0.5)
+        # Zero throttle via RC override so FC doesn't think it's flying
+        _connection.mav.rc_channels_override_send(
+            _connection.target_system,
+            _connection.target_component,
+            65535, 65535, 1000, 65535,   # ch1-4: ignore, ignore, throttle min, ignore
+            65535, 65535, 65535, 65535   # ch5-8: ignore
+        )
+        time.sleep(1.0)
         _connection.mav.command_long_send(
             _connection.target_system,
             _connection.target_component,
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0,
-            0,      # 0 = disarm
+            0,      # disarm
             21196,  # force
             0, 0, 0, 0, 0
         )
