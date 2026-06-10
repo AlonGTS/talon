@@ -228,13 +228,24 @@ def disarm():
         return
     from pymavlink import mavutil
     try:
+        # Switch to STABILIZE first — ArduPlane won't disarm in GUIDED if it thinks it's airborne
+        _connection.mav.command_long_send(
+            _connection.target_system,
+            _connection.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+            0,
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            2,  # STABILIZE
+            0, 0, 0, 0, 0
+        )
+        time.sleep(0.5)
         _connection.mav.command_long_send(
             _connection.target_system,
             _connection.target_component,
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0,
             0,      # 0 = disarm
-            21196,  # force disarm — bypasses in-air / safety checks
+            21196,  # force disarm
             0, 0, 0, 0, 0
         )
         print("[MAVLink] DISARM command sent")
