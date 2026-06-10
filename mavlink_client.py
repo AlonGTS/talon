@@ -222,29 +222,37 @@ _telem_thread.start()
 # Public API
 # ---------------------------------------------------------------------------
 
+def _is_armed():
+    """Return True if the FC heartbeat shows armed, False otherwise."""
+    try:
+        hb = _connection.recv_match(type='HEARTBEAT', blocking=True, timeout=2.0)
+        if hb:
+            from pymavlink import mavutil
+            return bool(hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+    except Exception:
+        pass
+    return False
+
+
 def disarm():
-    """Disarm the FC. Call on exit."""
+    """Disarm the FC."""
     if not _enabled:
         return
     from pymavlink import mavutil
     try:
-        # Disable logging — no SD card installed, ENOSPC blocks disarm
-        _connection.mav.param_set_send(
-            _connection.target_system,
-            _connection.target_component,
-            b'LOG_BACKEND_TYPE',
-            0,
-            mavutil.mavlink.MAV_PARAM_TYPE_INT32
-        )
-        time.sleep(0.3)
-        # Switch to STABILIZE first — ArduPlane won't disarm in GUIDED if it thinks it's airborne
+        armed = _is_armed()
+        print(f"[MAVLink] FC is {'ARMED' if armed else 'DISARMED'} — {'sending disarm' if armed else 'nothing to do'}")
+        if not armed:
+            global _launched
+            _launched = False
+            return
         _connection.mav.command_long_send(
             _connection.target_system,
             _connection.target_component,
             mavutil.mavlink.MAV_CMD_DO_SET_MODE,
             0,
             mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-            2,  # STABILIZE
+            0,  # MANUAL — most permissive for disarm
             0, 0, 0, 0, 0
         )
         time.sleep(0.5)
@@ -254,38 +262,28 @@ def disarm():
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0,
             0,      # 0 = disarm
-            21196,  # force disarm
+            21196,  # force
             0, 0, 0, 0, 0
         )
         print("[MAVLink] DISARM command sent")
-        global _launched
         _launched = False
     except Exception as e:
         print(f"[MAVLink] disarm failed: {e}")
 
 
 def arm_and_set_guided():
-    """Set GUIDED mode and arm the FC. Call once after connect()."""
+    """Set GUIDED mode and arm the FC."""
     if not _enabled:
         print("[MAVLink] Not connected — skipping arm/GUIDED")
         return
     from pymavlink import mavutil
-    # Disable logging — no SD card, avoids ENOSPC blocking arm/disarm
-    _connection.mav.param_set_send(
-        _connection.target_system,
-        _connection.target_component,
-        b'LOG_BACKEND_TYPE',
-        0,
-        mavutil.mavlink.MAV_PARAM_TYPE_INT32
-    )
-    time.sleep(0.3)
     _connection.mav.command_long_send(
         _connection.target_system,
         _connection.target_component,
         mavutil.mavlink.MAV_CMD_DO_SET_MODE,
         0,
         mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-        15,  # GUIDED mode number for ArduPlane
+        15,  # GUIDED
         0, 0, 0, 0, 0
     )
     print("[MAVLink] GUIDED mode command sent")
@@ -295,8 +293,8 @@ def arm_and_set_guided():
         _connection.target_component,
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
         0,
-        1,      # 1 = arm
-        21196,  # force arm — bypasses pre-arm checks (logging, GPS, etc.)
+        1,      # arm
+        21196,  # force
         0, 0, 0, 0, 0
     )
     print("[MAVLink] ARM command sent")
