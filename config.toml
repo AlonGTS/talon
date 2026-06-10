@@ -1,0 +1,75 @@
+[display]
+show_local = true  # true for playback/debug with monitor, false for headless flight
+
+[tracking]
+max_bb_width = 120
+max_bb_height = 120
+
+[gts-track.common]
+use_hog             = true
+use_color_names     = true
+use_gray            = false
+use_rgb             = true
+use_channel_weights = true
+use_segmentation    = false
+window_function     = "hann"
+kaiser_alpha        = 3.2
+hog_clip            = 2.0
+histogram_bins      = 16
+background_ratio    = 2
+
+[gts-track.fixed]
+number_of_scales    = 33
+scale_step          = 1.03
+scale_lr            = 0.15
+scale_sigma_factor  = 0.25
+scale_model_max_area = 512
+admm_iterations     = 9
+template_size       = 160
+filter_lr           = 0.08
+
+[gts-track.moving]
+number_of_scales    = 55
+scale_step          = 1.02
+scale_lr            = 0.65
+scale_sigma_factor  = 0.30
+scale_model_max_area = 1024
+admm_iterations     = 6
+template_size       = 200
+filter_lr           = 0.25
+
+[network]
+# "wlan0" = original network, "wlan1" = new USB dongle (MAHAT)
+interface        = "wlan0"
+gcs_udp_port     = 5600
+gcs_cmd_port     = 5601
+gcs_jpeg_quality = 40     # was 60 — lower = smaller frames (~12 KB vs ~35 KB)
+gcs_stream_width = 640  # was 640 — scale before encode (~3 Mbps vs ~8 Mbps @ 30fps)
+
+# Video transport: "jpeg_udp" = current JPEG-over-UDP for gcs.py
+#                  "webrtc"   = H.264 WebRTC served at http://<pi>:8080
+video_mode           = "jpeg_udp"
+webrtc_bitrate_kbps  = 0   # 0 = unconstrained; set e.g. 800 for narrow RF links
+
+[network.wlan0]
+bind_ip = "192.168.1.28"
+# gcs_ip no longer needed — Pi learns GCS IP dynamically from heartbeat packets
+
+[network.wlan1]
+bind_ip = "192.168.10.2"
+gcs_ip  = "192.168.10.8"
+
+[mavlink]
+pixhawk_port  = "/dev/ttyACM0"
+pixhawk_baud  = 115200
+gcs_ip        = "192.168.1.30"    # legacy field (kept for reference)
+gcs_port      = 14550
+local_port    = 14551
+# Dedicated unicast outputs — MAVProxy sends a copy to each IP:gcs_port
+# Add every QGC / GCS machine here that needs full telemetry
+extra_outputs = ["192.168.1.30", "192.168.1.32"]
+
+[camera]
+# Safe/default resolutions for IMX708 path
+main_sizes  = [[640, 480], [960, 540], [1280, 720], [1640, 1232]]
+lores_sizes = [[320, 240], [416, 312], [512, 384], [640,  480]]
