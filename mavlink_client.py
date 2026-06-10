@@ -266,8 +266,9 @@ def arm_and_set_guided():
         _connection.target_component,
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
         0,
-        1,  # 1 = arm
-        0, 0, 0, 0, 0, 0
+        1,      # 1 = arm
+        21196,  # force arm — bypasses pre-arm checks (logging, GPS, etc.)
+        0, 0, 0, 0, 0
     )
     print("[MAVLink] ARM command sent")
     global _launched
