@@ -27,6 +27,20 @@ _mavproxy_proc = None
 DEBUG           = False  # set True to print pitch/yaw values every frame
 SHOW_TELEMETRY  = False  # set True to print incoming ATTITUDE in the console
 
+# send_attitude_target() clamp: bounds how far the camera error is ever
+# allowed to rotate the target away from the FC's current attitude.
+MAX_ANGLE = math.radians(25)
+
+# ArduPlane's GUIDED SET_ATTITUDE_TARGET takes an absolute, horizon-referenced
+# roll/pitch/yaw demand (confirmed on the bench), so "hold current attitude"
+# requires composing the camera error onto the FC's latest reported attitude
+# before sending. _attitude_timestamp lets send_attitude_target() refuse to
+# compose onto a stale reading rather than send a wrong absolute target.
+_attitude_lock      = threading.Lock()
+_current_attitude    = None  # (roll, pitch, yaw) radians, or None until first ATTITUDE msg
+_attitude_timestamp  = 0.0
+MAX_ATTITUDE_AGE     = 0.3   # seconds; skip send if the cached attitude is older than this
+
 
 # ---------------------------------------------------------------------------
 # Launch state
@@ -121,7 +135,7 @@ def start_mavproxy(pixhawk_port="/dev/ttyACM0", pixhawk_baud=115200,
     global _mavproxy_proc
     pixhawk_port = _find_fc_port(pixhawk_port)
     cmd = [
-        "/home/mahat/webrtc_venv/bin/mavproxy.py",
+        "/home/mahat/mav_venv/bin/mavproxy.py",
         f"--master={pixhawk_port}",
         f"--baud={pixhawk_baud}",
         f"--out=udpout:127.0.0.1:{local_port}",
@@ -147,6 +161,22 @@ def _stop_mavproxy():
             _mavproxy_proc.kill()
 
 
+def _request_attitude_stream(rate_hz=20):
+    """Ask the FC to push ATTITUDE at rate_hz. send_attitude_target() composes
+    onto the latest ATTITUDE reading, so the default (~2-4 Hz) stream rate is
+    too stale for a per-frame control loop — this speeds it up explicitly."""
+    from pymavlink import mavutil
+    _connection.mav.command_long_send(
+        _connection.target_system,
+        _connection.target_component,
+        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+        0,
+        mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE,
+        int(1e6 / rate_hz),  # microseconds between messages
+        0, 0, 0, 0, 0
+    )
+
+
 def connect(url="udpin:0.0.0.0:14551", fallback_url=None):
     """
     Connect to MAVProxy via UDP and start the telemetry reader thread.
@@ -160,6 +190,7 @@ def connect(url="udpin:0.0.0.0:14551", fallback_url=None):
         _connection = mavutil.mavlink_connection(url)
         _connection.wait_heartbeat(timeout=5)
         _enabled = True
+        _request_attitude_stream()
         print(f"[MAVLink] Connected via MAVProxy ({url}), heartbeat received.")
     except Exception as e:
         print(f"[WARNING] MAVLink primary connection failed: {e}")
@@ -167,6 +198,7 @@ def connect(url="udpin:0.0.0.0:14551", fallback_url=None):
             try:
                 _connection = mavutil.mavlink_connection(fallback_url)
                 _enabled = True
+                _request_attitude_stream()
                 print(f"[MAVLink] Fallback connected ({fallback_url}), sending debug_vect to GCS directly.")
             except Exception as e2:
                 print(f"[WARNING] MAVLink fallback also failed: {e2}")
@@ -209,11 +241,15 @@ def _telemetry_reader():
                 continue
             if msg.get_type() == 'STATUSTEXT':
                 print(f"[FC] {msg.text.strip()}")
-            elif SHOW_TELEMETRY:
-                import math as _math
-                print(f"[Telem] roll={_math.degrees(msg.roll):+.1f}°  "
-                      f"pitch={_math.degrees(msg.pitch):+.1f}°  "
-                      f"yaw={_math.degrees(msg.yaw):+.1f}°")
+            elif msg.get_type() == 'ATTITUDE':
+                global _current_attitude, _attitude_timestamp
+                with _attitude_lock:
+                    _current_attitude = (msg.roll, msg.pitch, msg.yaw)
+                    _attitude_timestamp = time.time()
+                if SHOW_TELEMETRY:
+                    print(f"[Telem] roll={math.degrees(msg.roll):+.1f}°  "
+                          f"pitch={math.degrees(msg.pitch):+.1f}°  "
+                          f"yaw={math.degrees(msg.yaw):+.1f}°")
         except Exception as e:
             print(f"[Telem] read error: {e}")
             time.sleep(0.5)
@@ -318,22 +354,42 @@ def arm_and_set_guided():
     _launched = True
 
 
-def send_attitude_target(pitch, yaw, roll=0.0, thrust=0.5):
-    """Send SET_ATTITUDE_TARGET every frame. Units: radians. Call at ~10 Hz or faster."""
+def send_attitude_target(pitch_err, yaw_err, roll_err=0.0, thrust=0.5):
+    """Send SET_ATTITUDE_TARGET every frame. pitch_err/yaw_err/roll_err are
+    BODY-FRAME camera tracking errors (radians), clamped to MAX_ANGLE.
+    ArduPlane's GUIDED handler treats the quaternion as an ABSOLUTE,
+    horizon-referenced attitude demand (confirmed on the bench), so "camera
+    centered" must compose onto the FC's current attitude to mean "hold
+    here" rather than "go to level" — the error is composed onto the latest
+    reported ATTITUDE before sending. Skips the send if that reading is
+    stale (older than MAX_ATTITUDE_AGE) rather than command a wrong target.
+    Call at ~10 Hz or faster."""
     if not _enabled:
         if DEBUG:
-            print(f"[DEBUG] pitch={math.degrees(pitch):.2f}° yaw={math.degrees(yaw):.2f}°")
+            print(f"[DEBUG] pitch_err={math.degrees(pitch_err):.2f}° yaw_err={math.degrees(yaw_err):.2f}°")
         return
+    with _attitude_lock:
+        current = _current_attitude
+        age = time.time() - _attitude_timestamp
+    if current is None or age > MAX_ATTITUDE_AGE:
+        if DEBUG:
+            print(f"[MAVLink] set_attitude_target skipped: attitude stale/missing (age={age:.2f}s)")
+        return
+    roll  = max(-MAX_ANGLE, min(MAX_ANGLE, roll_err))
+    pitch = max(-MAX_ANGLE, min(MAX_ANGLE, pitch_err))
+    yaw   = max(-MAX_ANGLE, min(MAX_ANGLE, yaw_err))
     from pymavlink.quaternion import QuaternionBase
     try:
-        q = QuaternionBase([roll, pitch, yaw])
+        q_current = QuaternionBase([current[0], current[1], current[2]])
+        q_delta   = QuaternionBase([roll, pitch, yaw])
+        q = q_current * q_delta  # body-frame delta applied first, then current attitude -> absolute target
         _connection.mav.set_attitude_target_send(
             int(time.time() * 1000) & 0xFFFFFFFF,
             _connection.target_system,
             _connection.target_component,
             0b00000111,        # ignore body rates, use quaternion + thrust
             q,
-            0.0, 0.0, 0.0,    # body roll/pitch/yaw rates (ignored)
+            0.0, 0.0, 0.0,     # body roll/pitch/yaw rates (ignored)
             thrust
         )
         if DEBUG:

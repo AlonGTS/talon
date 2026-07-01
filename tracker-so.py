@@ -501,12 +501,10 @@ while True:
                 norm_dy = dy / mh
 
                 # Simple FOV→angle mapping (heuristic; tune to your camera FOV)
-                yaw   =  norm_dx * math.radians(60)   # ~60° HFOV
-                pitch = -norm_dy * math.radians(45)   # ~45° VFOV
-                yaw_err   =  norm_dx * math.radians(60)   # rad
-                pitch_err = -norm_dy * math.radians(45)   # rad
+                yaw_err   =  norm_dx * math.radians(60)   # ~60° HFOV
+                pitch_err = -norm_dy * math.radians(45)   # ~45° VFOV
 
-                mavlink_client.send_attitude_target(pitch, yaw)
+                mavlink_client.send_attitude_target(pitch_err, yaw_err)
 
 
                 # Box visuals
