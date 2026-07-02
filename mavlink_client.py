@@ -24,8 +24,8 @@ _enabled       = False
 _ser           = None
 _launched      = False
 _mavproxy_proc = None
-DEBUG           = False  # set True to print pitch/yaw values every frame
-SHOW_TELEMETRY  = False  # set True to print incoming ATTITUDE in the console
+DEBUG           = True  # set True to print pitch/yaw values every frame
+SHOW_TELEMETRY  = True  # set True to print incoming ATTITUDE in the console
 
 # send_attitude_target() clamp: bounds how far the camera error is ever
 # allowed to rotate the target away from the FC's current attitude.
@@ -281,46 +281,50 @@ def disarm():
     if not _enabled:
         return
     from pymavlink import mavutil
-    try:
-        armed = _is_armed()
-        print(f"[MAVLink] FC is {'ARMED' if armed else 'DISARMED'} — {'sending disarm' if armed else 'nothing to do'}")
-        if not armed:
-            global _launched
+    # Flask is threaded — arm_and_set_guided() and disarm() share this lock so
+    # an overlapping call (e.g. a stale UI auto-disarm racing a real launch
+    # click) can't interleave mode/arm commands with this one.
+    with _launch_lock:
+        try:
+            armed = _is_armed()
+            print(f"[MAVLink] FC is {'ARMED' if armed else 'DISARMED'} — {'sending disarm' if armed else 'nothing to do'}")
+            if not armed:
+                global _launched
+                _launched = False
+                return
+            _connection.mav.command_long_send(
+                _connection.target_system,
+                _connection.target_component,
+                mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+                0,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                0,  # MANUAL — most permissive for disarm
+                0, 0, 0, 0, 0
+            )
+            time.sleep(0.5)
+            # Neutral all surfaces + zero throttle
+            _connection.mav.rc_channels_override_send(
+                _connection.target_system,
+                _connection.target_component,
+                1500, 1500, 1000, 1500,   # roll, pitch, throttle, yaw → neutral/min
+                65535, 65535, 65535, 65535
+            )
+            time.sleep(1.0)
+            _connection.mav.command_long_send(
+                _connection.target_system,
+                _connection.target_component,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                0,
+                0,      # disarm
+                21196,  # force
+                0, 0, 0, 0, 0
+            )
+            time.sleep(0.5)
+            still_armed = _is_armed()
+            print(f"[MAVLink] DISARM {'succeeded' if not still_armed else 'FAILED — FC still armed'}")
             _launched = False
-            return
-        _connection.mav.command_long_send(
-            _connection.target_system,
-            _connection.target_component,
-            mavutil.mavlink.MAV_CMD_DO_SET_MODE,
-            0,
-            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-            0,  # MANUAL — most permissive for disarm
-            0, 0, 0, 0, 0
-        )
-        time.sleep(0.5)
-        # Neutral all surfaces + zero throttle
-        _connection.mav.rc_channels_override_send(
-            _connection.target_system,
-            _connection.target_component,
-            1500, 1500, 1000, 1500,   # roll, pitch, throttle, yaw → neutral/min
-            65535, 65535, 65535, 65535
-        )
-        time.sleep(1.0)
-        _connection.mav.command_long_send(
-            _connection.target_system,
-            _connection.target_component,
-            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-            0,
-            0,      # disarm
-            21196,  # force
-            0, 0, 0, 0, 0
-        )
-        time.sleep(0.5)
-        still_armed = _is_armed()
-        print(f"[MAVLink] DISARM {'succeeded' if not still_armed else 'FAILED — FC still armed'}")
-        _launched = False
-    except Exception as e:
-        print(f"[MAVLink] disarm error: {e}")
+        except Exception as e:
+            print(f"[MAVLink] disarm error: {e}")
 
 
 def arm_and_set_guided():
@@ -329,40 +333,55 @@ def arm_and_set_guided():
         print("[MAVLink] Not connected — skipping arm/GUIDED")
         return
     from pymavlink import mavutil
-    _connection.mav.command_long_send(
-        _connection.target_system,
-        _connection.target_component,
-        mavutil.mavlink.MAV_CMD_DO_SET_MODE,
-        0,
-        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-        15,  # GUIDED
-        0, 0, 0, 0, 0
-    )
-    print("[MAVLink] GUIDED mode command sent")
-    time.sleep(0.5)
-    _connection.mav.command_long_send(
-        _connection.target_system,
-        _connection.target_component,
-        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-        0,
-        1,      # arm
-        21196,  # force
-        0, 0, 0, 0, 0
-    )
-    print("[MAVLink] ARM command sent")
-    global _launched
-    _launched = True
+    with _launch_lock:
+        _connection.mav.command_long_send(
+            _connection.target_system,
+            _connection.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+            0,
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            15,  # GUIDED
+            0, 0, 0, 0, 0
+        )
+        print("[MAVLink] GUIDED mode command sent")
+        time.sleep(0.5)
+        _connection.mav.command_long_send(
+            _connection.target_system,
+            _connection.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0,
+            1,      # arm
+            21196,  # force
+            0, 0, 0, 0, 0
+        )
+        print("[MAVLink] ARM command sent")
+        global _launched
+        _launched = True
 
 
 def send_attitude_target(pitch_err, yaw_err, roll_err=0.0, thrust=0.5):
     """Send SET_ATTITUDE_TARGET every frame. pitch_err/yaw_err/roll_err are
     BODY-FRAME camera tracking errors (radians), clamped to MAX_ANGLE.
-    ArduPlane's GUIDED handler treats the quaternion as an ABSOLUTE,
-    horizon-referenced attitude demand (confirmed on the bench), so "camera
-    centered" must compose onto the FC's current attitude to mean "hold
-    here" rather than "go to level" — the error is composed onto the latest
-    reported ATTITUDE before sending. Skips the send if that reading is
-    stale (older than MAX_ATTITUDE_AGE) rather than command a wrong target.
+
+    ArduPlane's GUIDED handler treats this quaternion's axes completely
+    differently from each other (confirmed against ArduPlane source,
+    Attitude.cpp/GCS_MAVLink_Plane.cpp):
+      - roll/pitch extracted from the quaternion become nav_roll_cd /
+        nav_pitch_cd, ABSOLUTE angle targets fed into Plane's normal
+        attitude PID (which computes its own error against current
+        attitude) — so "camera centered" must compose onto the FC's
+        current roll/pitch to mean "hold here".
+      - yaw extracted from the quaternion is assigned STRAIGHT to
+        commanded_rudder with no reference to current heading at all —
+        it's an open-loop rudder deflection, not an attitude target.
+        Composing it onto current heading turns the rudder command into
+        ~absolute compass heading in centidegrees, saturating the rudder
+        toward whatever direction happens to be "north" instead of
+        responding to the body-frame camera error. So yaw is sent RAW
+        (just the clamped camera error, never composed).
+
+    Skips the send if the cached current-attitude reading is stale (older
+    than MAX_ATTITUDE_AGE) rather than command a wrong roll/pitch target.
     Call at ~10 Hz or faster."""
     if not _enabled:
         if DEBUG:
@@ -380,9 +399,13 @@ def send_attitude_target(pitch_err, yaw_err, roll_err=0.0, thrust=0.5):
     yaw   = max(-MAX_ANGLE, min(MAX_ANGLE, yaw_err))
     from pymavlink.quaternion import QuaternionBase
     try:
-        q_current = QuaternionBase([current[0], current[1], current[2]])
-        q_delta   = QuaternionBase([roll, pitch, yaw])
-        q = q_current * q_delta  # body-frame delta applied first, then current attitude -> absolute target
+        # Compose only roll/pitch onto current attitude -> absolute nav_roll_cd/
+        # nav_pitch_cd target. Yaw is deliberately left OUT of this composition
+        # (see docstring) and spliced in raw below.
+        q_current  = QuaternionBase([current[0], current[1], current[2]])
+        q_delta_rp = QuaternionBase([roll, pitch, 0.0])
+        roll_target, pitch_target, _ = (q_current * q_delta_rp).euler
+        q = QuaternionBase([roll_target, pitch_target, yaw])
         _connection.mav.set_attitude_target_send(
             int(time.time() * 1000) & 0xFFFFFFFF,
             _connection.target_system,
@@ -393,7 +416,11 @@ def send_attitude_target(pitch_err, yaw_err, roll_err=0.0, thrust=0.5):
             thrust
         )
         if DEBUG:
-            print(f"[MAVLink] SET_ATTITUDE_TARGET pitch={math.degrees(pitch):.2f}° "
-                  f"yaw={math.degrees(yaw):.2f}° thrust={thrust:.2f}")
+            print(f"[MAVLink] SET_ATTITUDE_TARGET composed_on=({math.degrees(current[0]):+.1f},"
+                  f"{math.degrees(current[1]):+.1f},{math.degrees(current[2]):+.1f})° "
+                  f"age={age*1000:.0f}ms err=({math.degrees(roll):+.2f},{math.degrees(pitch):+.2f},"
+                  f"{math.degrees(yaw):+.2f})° "
+                  f"sent_rp=({math.degrees(roll_target):+.1f},{math.degrees(pitch_target):+.1f})° "
+                  f"sent_yaw_raw={math.degrees(yaw):+.2f}° thrust={thrust:.2f}")
     except Exception as e:
         print(f"[MAVLink] set_attitude_target failed: {e}")
