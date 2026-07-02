@@ -24,6 +24,138 @@ from tkinter import filedialog, simpledialog
 import webrtc_server
 from gts_tracker import GTSTracker
 
+
+# ── Tracking Quality Monitor ─────────────────────────────────────────────────
+class TrackingQualityMonitor:
+    """
+    Per-frame confidence score [0.0–1.0] computed on top of CSRT.
+
+    CSRT's internal PSR is not exposed via OpenCV's Python bindings; this
+    class approximates it from three observable signals:
+
+      • Frame-to-frame NCC (55 %)  — compares the current ROI patch to the
+        patch from the PREVIOUS frame.  Between consecutive frames the scale
+        change is tiny even when the drone is approaching the target, so NCC
+        stays high on correct tracking and drops sharply on a drift event.
+        (Comparing to the *initial* template would fail as the drone closes in.)
+
+      • Velocity gate        (30 %)  — penalises bbox-centre jumps > 15 % of
+        the frame's larger dimension in a single step (teleportation = drift).
+
+      • Size-change gate     (15 %)  — penalises sudden bbox area changes
+        larger than 4× in one frame (unphysical growth/shrink).
+
+    Thresholds
+    ----------
+    score ≥ SCORE_GOOD        → green  box, attitude control enabled
+    score ≥ SCORE_UNCERTAIN   → orange box, attitude control still enabled (visible warn)
+    score <  SCORE_UNCERTAIN  → red    box, attitude control suppressed
+    score <  SCORE_UNCERTAIN for BAD_FRAMES_LIMIT consecutive frames → tracking broken
+    """
+
+    SCORE_GOOD        = 0.60
+    SCORE_UNCERTAIN   = 0.40
+    BAD_FRAMES_LIMIT  = 1      # 1 bad frame breaks tracking immediately
+    _TMPL_SIZE        = (64, 64)   # canonical patch size for NCC
+
+    def __init__(self):
+        self._prev_patch = None    # grayscale 64×64 from previous frame
+        self._prev_cx    = None
+        self._prev_cy    = None
+        self._prev_area  = None
+        self.score       = 1.0
+        self.bad_frames  = 0      # consecutive frames below SCORE_UNCERTAIN
+
+    # ── public API ────────────────────────────────────────────────────────
+
+    def init(self, frame: np.ndarray, bbox: tuple):
+        """
+        Capture the first appearance patch and reset history.
+        Call this on the first successful update after a new tracker is
+        initialised (pass lores frame + lores bbox).
+        """
+        x, y, w, h = (int(v) for v in bbox)
+        patch = self._safe_crop(frame, x, y, w, h)
+        if patch is not None and patch.size > 0:
+            gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+            self._prev_patch = cv2.resize(gray, self._TMPL_SIZE)
+        else:
+            self._prev_patch = None
+        self._prev_cx   = x + w // 2
+        self._prev_cy   = y + h // 2
+        self._prev_area = max(1, w * h)
+        self.score      = 1.0
+
+    def update(self, frame: np.ndarray, bbox: tuple) -> float:
+        """
+        Compute confidence for this frame after a successful CSRT update.
+        frame and bbox must be in lores coordinate space.
+        Returns score ∈ [0.0, 1.0] and advances internal state.
+        """
+        if bbox is None:
+            self.score = 0.0
+            return self.score
+
+        xl, yl, wl, hl = (int(v) for v in bbox)
+        cx, cy         = xl + wl // 2, yl + hl // 2
+        curr_area      = max(1, wl * hl)
+
+        # ── Frame-to-frame NCC ────────────────────────────────────────────
+        patch = self._safe_crop(frame, xl, yl, wl, hl)
+        if patch is not None and patch.size > 0:
+            gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+            curr = cv2.resize(gray, self._TMPL_SIZE)
+            if self._prev_patch is not None:
+                res       = cv2.matchTemplate(curr, self._prev_patch, cv2.TM_CCOEFF_NORMED)
+                ncc_score = float(np.clip(res[0, 0], 0.0, 1.0))
+            else:
+                ncc_score = 0.5          # no previous patch yet → neutral
+            self._prev_patch = curr      # roll forward
+        else:
+            ncc_score = 0.5              # patch out of bounds → neutral
+
+        # ── Velocity gate ─────────────────────────────────────────────────
+        if self._prev_cx is not None:
+            fh, fw    = frame.shape[:2]
+            jump      = math.hypot(cx - self._prev_cx, cy - self._prev_cy)
+            max_jump  = max(fw, fh) * 0.15
+            vel_score = float(np.clip(1.0 - jump / max_jump, 0.0, 1.0))
+        else:
+            vel_score = 1.0
+        self._prev_cx, self._prev_cy = cx, cy
+
+        # ── Size-change gate ──────────────────────────────────────────────
+        if self._prev_area is not None:
+            ratio      = max(curr_area, self._prev_area) / min(curr_area, self._prev_area)
+            # ratio 1.0 → score 1.0 | ratio ≥ 4.0 → score 0.0 (linear)
+            size_score = float(np.clip(1.0 - (ratio - 1.0) / 3.0, 0.0, 1.0))
+        else:
+            size_score = 1.0
+        self._prev_area = curr_area
+
+        # ── Combined score ────────────────────────────────────────────────
+        self.score = 0.55 * ncc_score + 0.30 * vel_score + 0.15 * size_score
+        return self.score
+
+    def reset(self):
+        self._prev_patch = None
+        self._prev_cx    = self._prev_cy = None
+        self._prev_area  = None
+        self.score       = 1.0
+        self.bad_frames  = 0
+
+    # ── helpers ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _safe_crop(frame, x, y, w, h):
+        fh, fw = frame.shape[:2]
+        x1, y1 = max(0, x), max(0, y)
+        x2, y2 = min(fw, x + w), min(fh, y + h)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return frame[y1:y2, x1:x2]
+
+
 # Load configuration
 with open(_HERE / "config.toml", "rb") as _f:
     _cfg = tomllib.load(_f)
@@ -50,6 +182,8 @@ output_frame = None               # Final frame after overlays → served to MJP
 # Mutable state shared between main loop, reader threads, and Flask/WebRTC
 state = SimpleNamespace(
     current_frame   = None,   # Raw latest frame from camera/file (no overlays)
+    frame_seq       = 0,      # Bumped each time current_frame is replaced; lets the
+                               # main loop tell "new frame" apart from "same frame again"
     command_from_remote = None,   # One-letter command from web UI: 'r','s','q'
     bbox            = None,   # Current CSRT tracking box (MAIN coords: x, y, w, h)
     tracking        = False,  # Tracking on/off flag
@@ -134,6 +268,7 @@ def _reader_playback(path, loop=False):
 
         with frame_ready:
             state.current_frame = frame
+            state.frame_seq += 1
             frame_ready.notify_all()
 
         # Adjust pacing
@@ -175,6 +310,7 @@ def _reader_live_picam():
             continue
         with frame_ready:
             state.current_frame = frame  # raw MAIN frame only
+            state.frame_seq += 1
             frame_ready.notify_all()
 
 def _restart_reader_live():
@@ -431,13 +567,24 @@ def _udp_cmd_listener():
 
 Thread(target=_udp_cmd_listener, daemon=True).start()
 
+_tq_monitor      = TrackingQualityMonitor()
+_last_tracker_id = None   # detect tracker replacement from ANY init path (flask, mouse, BB-clamp)
+_tq_needs_init   = True   # capture first patch on next successful update
+
 # === Main Loop (render & publish) ===
+_last_frame_seq = -1
 while True:
-    # Wait for a new current_frame from reader
+    # Wait for a new current_frame from reader (frame_seq only advances when the
+    # reader publishes one — without this the loop free-spins reprocessing the
+    # same frame once current_frame stops being None, flooding MAVLink sends)
     with frame_ready:
-        if state.current_frame is None:
+        if state.current_frame is None or state.frame_seq == _last_frame_seq:
             frame_ready.wait(timeout=0.02)
-        frame = None if state.current_frame is None else state.current_frame.copy()
+        if state.current_frame is None or state.frame_seq == _last_frame_seq:
+            frame = None
+        else:
+            frame = state.current_frame.copy()
+            _last_frame_seq = state.frame_seq
 
     if frame is None:
         key = cv2.waitKey(1) & 0xFF
@@ -467,6 +614,15 @@ while True:
     # Tracking on LORES
     lores_frame = cv2.resize(frame, (lw, lh), interpolation=cv2.INTER_LINEAR)
 
+    # Detect tracker replacement from ANY init path (flask_app.py's remote
+    # target-select, the local mouse callback, or the BB-clamp recreate below)
+    # — comparing object identity here catches all of them without needing a
+    # reset call at every individual creation site.
+    if state.tracker is not None and id(state.tracker) != _last_tracker_id:
+        _last_tracker_id = id(state.tracker)
+        _tq_needs_init   = True
+        _tq_monitor.reset()
+
     if state.tracking and state.tracker is not None:
         try:
             success, bbox_lo = state.tracker.update(lores_frame)
@@ -490,9 +646,20 @@ while True:
                     wb = max(2, int(bw * sx_m2l)); hb = max(2, int(bh * sy_m2l))
                     state.tracker = create_csrt_tracker(state.bMoovingTgt)
                     state.tracker.init(lores_frame, (xb, yb, wb, hb))
+                    _last_tracker_id = id(state.tracker)
+                    _tq_needs_init   = True      # new tracker → re-capture patch
+                    _tq_monitor.reset()
                     print(f"[INFO] BB limited to {bw}x{bh} (max {MAX_BB_WIDTH}x{MAX_BB_HEIGHT})")
 
                 state.bbox = (x, y, bw, bh)
+
+                # Tracking quality: init on first frame, update on all subsequent ones
+                if _tq_needs_init:
+                    _tq_monitor.init(lores_frame, (xl, yl, wl, hl))
+                    _tq_needs_init = False
+                else:
+                    _tq_monitor.update(lores_frame, (xl, yl, wl, hl))
+                tq = _tq_monitor.score
 
                 # Center offsets for attitude mapping (MAIN coords)
                 dx = cx - mw // 2
@@ -504,26 +671,56 @@ while True:
                 yaw_err   =  norm_dx * math.radians(60)   # ~60° HFOV
                 pitch_err = -norm_dy * math.radians(45)   # ~45° VFOV
 
-                mavlink_client.send_attitude_target(pitch_err, yaw_err)
-
-
-                # Box visuals
-                if state.bMoovingTgt:
-                    box_color = (0, 0, 255)
-                    cross_color = (0, 0, 255)
+                # Count consecutive bad frames — break tracking if drift sustained
+                if tq < TrackingQualityMonitor.SCORE_UNCERTAIN:
+                    _tq_monitor.bad_frames += 1
                 else:
-                    box_color = (255, 0, 0)
-                    cross_color = (255, 0, 0)
+                    _tq_monitor.bad_frames = 0   # good frame resets the counter
 
-                cv2.rectangle(frame, (x, y), (x + bw, y + bh), box_color, 2)
-                cv2.line(frame, (cx - 10, cy), (cx + 10, cy), cross_color, 1)
-                cv2.line(frame, (cx, cy - 10), (cx, cy + 10), cross_color, 1)
+                if _tq_monitor.bad_frames >= TrackingQualityMonitor.BAD_FRAMES_LIMIT:
+                    print(f"[TQ]   Drift detected ({_tq_monitor.bad_frames} bad frames, "
+                          f"score={tq:.2f}) — tracking broken, re-select target")
+                    state.tracking = False
+                    state.tracker  = None
+                    _tq_monitor.reset()
+                    # Skip the rest of the draw block — show lost message instead
+                    cv2.putText(frame, "Drift — re-select target", (10, 140),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                else:
+                    # Only drive control surfaces when quality is sufficient
+                    if tq >= TrackingQualityMonitor.SCORE_UNCERTAIN:
+                        mavlink_client.send_attitude_target(pitch_err, yaw_err)
+
+                    # Box color encodes quality level
+                    if tq >= TrackingQualityMonitor.SCORE_GOOD:
+                        box_color = (0, 200, 0)      # green  — good
+                    elif tq >= TrackingQualityMonitor.SCORE_UNCERTAIN:
+                        box_color = (0, 140, 255)    # orange — uncertain, still sending
+                    else:
+                        box_color = (0, 0, 255)      # red    — unstable, counting down
+
+                    cv2.rectangle(frame, (x, y), (x + bw, y + bh), box_color, 2)
+                    cv2.line(frame, (cx - 10, cy), (cx + 10, cy), box_color, 1)
+                    cv2.line(frame, (cx, cy - 10), (cx, cy + 10), box_color, 1)
             else:
+                # tracker.update() itself failed — don't leave state.tracker alive to
+                # keep trying on its own; it can re-lock onto the wrong thing. Same
+                # hard stop as the TQ drift-kill: require an explicit re-select.
+                state.tracking = False
+                state.tracker  = None
+                _tq_monitor.reset()
                 cv2.putText(frame, "Tracking lost", (10, 140),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         except Exception as e:
             print(f"[ERROR] Tracker update failed: {e}")
             state.tracking = False
+    else:
+        # Persistent (not one-frame) indicator that no tracker is active —
+        # without this, the "Drift — re-select target" message only shows for
+        # the single frame it fires on, then the screen goes blank with no
+        # explanation once state.tracker is dropped to None.
+        cv2.putText(frame, "No target — click to select", (10, 140),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
     # Write to file if in record mode
     if args.mode == 'record' and writer is not None:
