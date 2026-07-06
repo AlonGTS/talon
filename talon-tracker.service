@@ -1,10 +1,10 @@
 [Unit]
-Description=ASIO Tracker
+Description=Talon Tracker
 After=network.target
 
 [Service]
 User=mahat
-WorkingDirectory=/home/mahat/ASIO
+WorkingDirectory=/home/mahat/talon
 Environment=PATH=/home/mahat/webrtc_venv/bin:/home/mahat/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/home/mahat/webrtc_venv/bin/python3 tracker-so.py --mode live
 Restart=on-failure
