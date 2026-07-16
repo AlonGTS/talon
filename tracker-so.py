@@ -614,6 +614,7 @@ while True:
 
     # Tracking on LORES
     lores_frame = cv2.resize(frame, (lw, lh), interpolation=cv2.INTER_LINEAR)
+    _attitude_sent = False
 
     # Detect tracker replacement from ANY init path (flask_app.py's remote
     # target-select, the local mouse callback, or the BB-clamp recreate below)
@@ -691,6 +692,7 @@ while True:
                     # Only drive control surfaces when quality is sufficient
                     if tq >= TrackingQualityMonitor.SCORE_UNCERTAIN:
                         mavlink_client.send_attitude_target(pitch_err, yaw_err)
+                        _attitude_sent = True
 
                     # Box color encodes quality level
                     if tq >= TrackingQualityMonitor.SCORE_GOOD:
@@ -722,6 +724,13 @@ while True:
         # explanation once state.tracker is dropped to None.
         cv2.putText(frame, "No target — click to select", (10, 140),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+    # PX4's OFFBOARD mode auto-exits (COM_OF_LOSS_T) if it stops receiving
+    # setpoints, even briefly — so once launched we must keep the stream
+    # alive every frame, not just while a target is actively tracked.
+    # Harmless on ArduPlane too: a zero-error target just holds/centers.
+    if mavlink_client._launched and not _attitude_sent:
+        mavlink_client.send_attitude_target(0.0, 0.0)
 
     # Write to file if in record mode
     if args.mode == 'record' and writer is not None:

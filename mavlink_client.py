@@ -251,16 +251,25 @@ def connect_serial(port="/dev/serial0", baud=57600):
 # ---------------------------------------------------------------------------
 
 def _telemetry_reader():
+    from pymavlink import mavutil
+    mav_result_names = mavutil.mavlink.enums['MAV_RESULT']
     while True:
         if not _enabled or _connection is None:
             time.sleep(0.5)
             continue
         try:
-            msg = _connection.recv_match(type=['ATTITUDE', 'STATUSTEXT'], blocking=True, timeout=1.0)
+            msg = _connection.recv_match(type=['ATTITUDE', 'STATUSTEXT', 'COMMAND_ACK'],
+                                          blocking=True, timeout=1.0)
             if msg is None:
                 continue
             if msg.get_type() == 'STATUSTEXT':
                 print(f"[FC] {msg.text.strip()}")
+            elif msg.get_type() == 'COMMAND_ACK':
+                result = mav_result_names.get(msg.result)
+                result_name = result.name if result else msg.result
+                cmd = mavutil.mavlink.enums['MAV_CMD'].get(msg.command)
+                cmd_name = cmd.name if cmd else msg.command
+                print(f"[FC] COMMAND_ACK {cmd_name} -> {result_name}")
             elif msg.get_type() == 'ATTITUDE':
                 global _current_attitude, _attitude_timestamp
                 with _attitude_lock:
@@ -364,46 +373,49 @@ def arm_and_set_guided():
         return
     from pymavlink import mavutil
     with _launch_lock:
-        if _autopilot == "px4":
-            # PX4 rejects the switch into OFFBOARD unless a setpoint stream is
-            # already flowing — prime it with a few no-op attitude targets
-            # before requesting the mode change.
-            for _ in range(10):
-                send_attitude_target(0.0, 0.0, thrust=0.0)
-                time.sleep(0.05)
-            base_mode = (mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
-                         | mavutil.mavlink.MAV_MODE_FLAG_AUTO_ENABLED
-                         | mavutil.mavlink.MAV_MODE_FLAG_STABILIZE_ENABLED
-                         | mavutil.mavlink.MAV_MODE_FLAG_GUIDED_ENABLED)
-            custom_mode = _PX4_MAIN_MODE_OFFBOARD << 16
-            mode_label = "OFFBOARD"
-        else:
-            base_mode = mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
-            custom_mode = 15  # ArduPlane GUIDED
-            mode_label = "GUIDED"
-        _connection.mav.command_long_send(
-            _connection.target_system,
-            _connection.target_component,
-            mavutil.mavlink.MAV_CMD_DO_SET_MODE,
-            0,
-            base_mode,
-            custom_mode,
-            0, 0, 0, 0, 0
-        )
-        print(f"[MAVLink] {mode_label} mode command sent")
-        time.sleep(0.5)
-        _connection.mav.command_long_send(
-            _connection.target_system,
-            _connection.target_component,
-            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-            0,
-            1,      # arm
-            21196,  # force
-            0, 0, 0, 0, 0
-        )
-        print("[MAVLink] ARM command sent")
-        global _launched
-        _launched = True
+        try:
+            if _autopilot == "px4":
+                # PX4 rejects the switch into OFFBOARD unless a setpoint stream is
+                # already flowing — prime it with a few no-op attitude targets
+                # before requesting the mode change.
+                for _ in range(10):
+                    send_attitude_target(0.0, 0.0, thrust=0.0)
+                    time.sleep(0.05)
+                base_mode = (mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+                             | mavutil.mavlink.MAV_MODE_FLAG_AUTO_ENABLED
+                             | mavutil.mavlink.MAV_MODE_FLAG_STABILIZE_ENABLED
+                             | mavutil.mavlink.MAV_MODE_FLAG_GUIDED_ENABLED)
+                custom_mode = _PX4_MAIN_MODE_OFFBOARD << 16
+                mode_label = "OFFBOARD"
+            else:
+                base_mode = mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+                custom_mode = 15  # ArduPlane GUIDED
+                mode_label = "GUIDED"
+            _connection.mav.command_long_send(
+                _connection.target_system,
+                _connection.target_component,
+                mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+                0,
+                base_mode,
+                custom_mode,
+                0, 0, 0, 0, 0
+            )
+            print(f"[MAVLink] {mode_label} mode command sent")
+            time.sleep(0.5)
+            _connection.mav.command_long_send(
+                _connection.target_system,
+                _connection.target_component,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                0,
+                1,      # arm
+                21196,  # force
+                0, 0, 0, 0, 0
+            )
+            print("[MAVLink] ARM command sent")
+            global _launched
+            _launched = True
+        except Exception as e:
+            print(f"[MAVLink] arm_and_set_guided error: {e}")
 
 
 def send_attitude_target(pitch_err, yaw_err, roll_err=0.0, thrust=0.5):
