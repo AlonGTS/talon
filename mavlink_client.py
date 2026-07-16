@@ -284,9 +284,7 @@ def _telemetry_reader():
                 # accepted"; PX4 can silently reject the state change after
                 # ACKing receipt. Only print on change to avoid flooding
                 # (HEARTBEAT streams at ~1Hz regardless).
-                if (_connection is not None
-                        and msg.get_srcSystem() == _connection.target_system
-                        and msg.get_srcComponent() == _connection.target_component):
+                if _connection is not None and msg.get_srcSystem() == _connection.target_system:
                     global _last_hb_armed, _last_hb_mode
                     armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
                     if _autopilot == "px4":
