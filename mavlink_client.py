@@ -250,6 +250,14 @@ def connect_serial(port="/dev/serial0", baud=57600):
 # Telemetry reader thread
 # ---------------------------------------------------------------------------
 
+_PX4_MAIN_MODE_NAMES = {
+    1: "MANUAL", 2: "ALTCTL", 3: "POSCTL", 4: "AUTO", 5: "ACRO",
+    6: "OFFBOARD", 7: "STABILIZED", 8: "RATTITUDE",
+}
+_last_hb_armed = None
+_last_hb_mode  = None
+
+
 def _telemetry_reader():
     from pymavlink import mavutil
     mav_result_names = mavutil.mavlink.enums['MAV_RESULT']
@@ -258,7 +266,7 @@ def _telemetry_reader():
             time.sleep(0.5)
             continue
         try:
-            msg = _connection.recv_match(type=['ATTITUDE', 'STATUSTEXT', 'COMMAND_ACK'],
+            msg = _connection.recv_match(type=['ATTITUDE', 'STATUSTEXT', 'COMMAND_ACK', 'HEARTBEAT'],
                                           blocking=True, timeout=1.0)
             if msg is None:
                 continue
@@ -270,6 +278,25 @@ def _telemetry_reader():
                 cmd = mavutil.mavlink.enums['MAV_CMD'].get(msg.command)
                 cmd_name = cmd.name if cmd else msg.command
                 print(f"[FC] COMMAND_ACK {cmd_name} -> {result_name}")
+            elif msg.get_type() == 'HEARTBEAT':
+                # Ground truth for the actual current mode — DO_SET_MODE's
+                # COMMAND_ACK only means "command parsed", not "transition
+                # accepted"; PX4 can silently reject the state change after
+                # ACKing receipt. Only print on change to avoid flooding
+                # (HEARTBEAT streams at ~1Hz regardless).
+                if (_connection is not None
+                        and msg.get_srcSystem() == _connection.target_system
+                        and msg.get_srcComponent() == _connection.target_component):
+                    global _last_hb_armed, _last_hb_mode
+                    armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                    if _autopilot == "px4":
+                        main_mode = (msg.custom_mode >> 16) & 0xFF
+                        mode_name = _PX4_MAIN_MODE_NAMES.get(main_mode, f"main_mode={main_mode}")
+                    else:
+                        mode_name = f"custom_mode={msg.custom_mode}"
+                    if (armed, mode_name) != (_last_hb_armed, _last_hb_mode):
+                        print(f"[FC] HEARTBEAT armed={armed} mode={mode_name}")
+                        _last_hb_armed, _last_hb_mode = armed, mode_name
             elif msg.get_type() == 'ATTITUDE':
                 global _current_attitude, _attitude_timestamp
                 with _attitude_lock:
