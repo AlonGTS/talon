@@ -27,6 +27,26 @@ _mavproxy_proc = None
 DEBUG           = True  # set True to print pitch/yaw values every frame
 SHOW_TELEMETRY  = True  # set True to print incoming ATTITUDE in the console
 
+# "ardupilot" or "px4" — set via set_autopilot() before connect(). Selects
+# MAV_CMD_DO_SET_MODE encoding, whether OFFBOARD/GUIDED needs a primed
+# setpoint stream first, and how SET_ATTITUDE_TARGET's yaw is composed.
+_autopilot = "ardupilot"
+
+# PX4 custom_mode packs main_mode into bits 16-23 (sub_mode in 24-31).
+# Values from PX4's mavlink/mavlink_main.h custom mode enum.
+_PX4_MAIN_MODE_MANUAL   = 1
+_PX4_MAIN_MODE_OFFBOARD = 6
+
+
+def set_autopilot(kind: str):
+    """Select "ardupilot" or "px4" mode-switch/attitude-target behavior.
+    Call before connect()."""
+    global _autopilot
+    kind = kind.lower()
+    if kind not in ("ardupilot", "px4"):
+        raise ValueError(f"unknown autopilot kind: {kind!r} (expected 'ardupilot' or 'px4')")
+    _autopilot = kind
+
 # send_attitude_target() clamp: bounds how far the camera error is ever
 # allowed to rotate the target away from the FC's current attitude.
 MAX_ANGLE = math.radians(25)
@@ -292,13 +312,23 @@ def disarm():
                 global _launched
                 _launched = False
                 return
+            if _autopilot == "px4":
+                # PX4 MANUAL: main_mode=1, sub_mode=0 — "0" is not a valid PX4
+                # main_mode (that's ArduPlane's MANUAL index, not PX4's).
+                base_mode = (mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+                             | mavutil.mavlink.MAV_MODE_FLAG_STABILIZE_ENABLED
+                             | mavutil.mavlink.MAV_MODE_FLAG_MANUAL_INPUT_ENABLED)
+                custom_mode = _PX4_MAIN_MODE_MANUAL << 16
+            else:
+                base_mode = mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+                custom_mode = 0  # ArduPlane MANUAL — most permissive for disarm
             _connection.mav.command_long_send(
                 _connection.target_system,
                 _connection.target_component,
                 mavutil.mavlink.MAV_CMD_DO_SET_MODE,
                 0,
-                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                0,  # MANUAL — most permissive for disarm
+                base_mode,
+                custom_mode,
                 0, 0, 0, 0, 0
             )
             time.sleep(0.5)
@@ -328,22 +358,39 @@ def disarm():
 
 
 def arm_and_set_guided():
-    """Set GUIDED mode and arm the FC."""
+    """Set GUIDED (ArduPilot) or OFFBOARD (PX4) mode and arm the FC."""
     if not _enabled:
         print("[MAVLink] Not connected — skipping arm/GUIDED")
         return
     from pymavlink import mavutil
     with _launch_lock:
+        if _autopilot == "px4":
+            # PX4 rejects the switch into OFFBOARD unless a setpoint stream is
+            # already flowing — prime it with a few no-op attitude targets
+            # before requesting the mode change.
+            for _ in range(10):
+                send_attitude_target(0.0, 0.0, thrust=0.0)
+                time.sleep(0.05)
+            base_mode = (mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+                         | mavutil.mavlink.MAV_MODE_FLAG_AUTO_ENABLED
+                         | mavutil.mavlink.MAV_MODE_FLAG_STABILIZE_ENABLED
+                         | mavutil.mavlink.MAV_MODE_FLAG_GUIDED_ENABLED)
+            custom_mode = _PX4_MAIN_MODE_OFFBOARD << 16
+            mode_label = "OFFBOARD"
+        else:
+            base_mode = mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+            custom_mode = 15  # ArduPlane GUIDED
+            mode_label = "GUIDED"
         _connection.mav.command_long_send(
             _connection.target_system,
             _connection.target_component,
             mavutil.mavlink.MAV_CMD_DO_SET_MODE,
             0,
-            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-            15,  # GUIDED
+            base_mode,
+            custom_mode,
             0, 0, 0, 0, 0
         )
-        print("[MAVLink] GUIDED mode command sent")
+        print(f"[MAVLink] {mode_label} mode command sent")
         time.sleep(0.5)
         _connection.mav.command_long_send(
             _connection.target_system,
@@ -377,8 +424,13 @@ def send_attitude_target(pitch_err, yaw_err, roll_err=0.0, thrust=0.5):
         Composing it onto current heading turns the rudder command into
         ~absolute compass heading in centidegrees, saturating the rudder
         toward whatever direction happens to be "north" instead of
-        responding to the body-frame camera error. So yaw is sent RAW
-        (just the clamped camera error, never composed).
+        responding to the body-frame camera error. So on ArduPilot yaw is
+        sent RAW (just the clamped camera error, never composed).
+
+    PX4's OFFBOARD attitude controller has no such split: all three axes of
+    the quaternion are a normal absolute attitude setpoint, so on PX4 yaw is
+    composed onto current heading exactly like roll/pitch (NOT verified on
+    the bench yet — confirm before flight).
 
     Skips the send if the cached current-attitude reading is stale (older
     than MAX_ATTITUDE_AGE) rather than command a wrong roll/pitch target.
@@ -399,13 +451,21 @@ def send_attitude_target(pitch_err, yaw_err, roll_err=0.0, thrust=0.5):
     yaw   = max(-MAX_ANGLE, min(MAX_ANGLE, yaw_err))
     from pymavlink.quaternion import QuaternionBase
     try:
-        # Compose only roll/pitch onto current attitude -> absolute nav_roll_cd/
-        # nav_pitch_cd target. Yaw is deliberately left OUT of this composition
-        # (see docstring) and spliced in raw below.
-        q_current  = QuaternionBase([current[0], current[1], current[2]])
-        q_delta_rp = QuaternionBase([roll, pitch, 0.0])
-        roll_target, pitch_target, _ = (q_current * q_delta_rp).euler
-        q = QuaternionBase([roll_target, pitch_target, yaw])
+        q_current = QuaternionBase([current[0], current[1], current[2]])
+        if _autopilot == "px4":
+            # PX4: compose all three axes onto current attitude -> absolute
+            # attitude setpoint (see docstring).
+            q_delta = QuaternionBase([roll, pitch, yaw])
+            roll_target, pitch_target, yaw_target = (q_current * q_delta).euler
+            q = QuaternionBase([roll_target, pitch_target, yaw_target])
+        else:
+            # ArduPlane: compose only roll/pitch -> absolute nav_roll_cd/
+            # nav_pitch_cd target. Yaw is deliberately left OUT of this
+            # composition (see docstring) and spliced in raw below.
+            q_delta_rp = QuaternionBase([roll, pitch, 0.0])
+            roll_target, pitch_target, _ = (q_current * q_delta_rp).euler
+            yaw_target = yaw
+            q = QuaternionBase([roll_target, pitch_target, yaw_target])
         _connection.mav.set_attitude_target_send(
             int(time.time() * 1000) & 0xFFFFFFFF,
             _connection.target_system,
@@ -421,6 +481,7 @@ def send_attitude_target(pitch_err, yaw_err, roll_err=0.0, thrust=0.5):
                   f"age={age*1000:.0f}ms err=({math.degrees(roll):+.2f},{math.degrees(pitch):+.2f},"
                   f"{math.degrees(yaw):+.2f})° "
                   f"sent_rp=({math.degrees(roll_target):+.1f},{math.degrees(pitch_target):+.1f})° "
-                  f"sent_yaw_raw={math.degrees(yaw):+.2f}° thrust={thrust:.2f}")
+                  f"sent_yaw_{'composed' if _autopilot == 'px4' else 'raw'}="
+                  f"{math.degrees(yaw_target):+.2f}° thrust={thrust:.2f}")
     except Exception as e:
         print(f"[MAVLink] set_attitude_target failed: {e}")

@@ -328,6 +328,7 @@ def _restart_reader_live():
 # === MAVLink Setup ===
 import mavlink_client
 _mav = _cfg["mavlink"]
+mavlink_client.set_autopilot(_mav.get("autopilot", "ardupilot"))
 mavlink_client.start_mavproxy(
     pixhawk_port  = _mav["pixhawk_port"],
     pixhawk_baud  = _mav["pixhawk_baud"],
