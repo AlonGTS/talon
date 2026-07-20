@@ -197,6 +197,84 @@ def _request_attitude_stream(rate_hz=20):
     )
 
 
+_PX4_RCL_EXCEPT_OFFBOARD = 4  # COM_RCL_EXCEPT bitmask bit: exempt Offboard from RC-loss failsafe
+
+# EKF2_NOAID_TOUT ceiling: PX4 flags position invalid once dead-reckoning (pure
+# IMU, no GPS/vision/flow aiding) has run longer than this many microseconds.
+# We have no GPS at all and only ever send attitude+thrust setpoints (never
+# need position), so push this as high as PX4 will accept to keep position
+# "valid" for the whole flight rather than have it expire mid-flight.
+_PX4_NOAID_TOUT_US = 2_000_000_000  # ~33 minutes
+
+
+# PX4 params this rig always wants fixed to a specific value on every connect.
+# Blind writes, not read-modify-write: MAVProxy does its own full ~1150-param
+# bulk fetch right after connecting, which floods/delays PARAM_VALUE replies
+# on this same link enough that waiting on a read reliably timed out on the
+# bench (tried up to a 20s budget). None of these need the old value anyway —
+# this rig has a fixed role (no RC, no GPS, attitude-only offboard), so
+# there's nothing else that would have set competing bits/values worth
+# preserving. Confirmation is logged asynchronously via PARAM_VALUE in
+# _telemetry_reader instead of blocking connect() on a reply.
+_PX4_FIXED_PARAMS = {
+    # Bitmask bit 2 = exempt Offboard from the RC-loss failsafe. Without this,
+    # PX4 treats "no RC ever received" as RC-lost from boot and silently
+    # reverts/blocks OFFBOARD entry — DO_SET_MODE still ACKs ACCEPTED, but
+    # HEARTBEAT ground-truth shows the FC stuck in its old mode. Confirmed on
+    # the bench (no RC transmitter connected).
+    'COM_RCL_EXCEPT': 4,
+    # This airframe has no GPS receiver at all, ever, and mavlink_client only
+    # sends attitude+thrust setpoints (never position/velocity), so a GPS
+    # position estimate is neither available nor needed. Left at the default
+    # (requiring GPS), the EKF never validates a position and PX4's generic
+    # position-invalid failsafe force-switches to LAND a few seconds after
+    # arming regardless of flight mode — confirmed on the bench: OFFBOARD
+    # entry silently reverted, HEARTBEAT showed AUTO/LAND ~9s after arm, with
+    # the land-detector oscillating Takeoff/Landing continuously afterward.
+    'EKF2_GPS_CTRL': 0,
+    # Ceiling on how long PX4 trusts pure-IMU dead reckoning (no GPS/vision/
+    # flow aiding) before flagging position invalid again. Push it to the
+    # max PX4 will accept so that failsafe never re-trips mid-flight.
+    'EKF2_NOAID_TOUT': 2_000_000_000,  # microseconds, ~33 minutes
+}
+
+
+def _apply_px4_fixed_params():
+    from pymavlink import mavutil
+    for name, value in _PX4_FIXED_PARAMS.items():
+        packed = struct.unpack('<f', struct.pack('<i', value))[0]
+        _connection.mav.param_set_send(
+            _connection.target_system, _connection.target_component,
+            name.encode(), packed, mavutil.mavlink.MAV_PARAM_TYPE_INT32
+        )
+        print(f"[MAVLink] {name} -> {value} (sent, see async confirmation)")
+
+
+def _lock_onto_autopilot(conn, timeout=5.0):
+    """wait_heartbeat() alone does NOT set target_system/target_component —
+    that's a common pymavlink footgun. target_system auto-populates only as
+    a side effect (pymavlink locks onto the srcSystem of the *first* HEARTBEAT
+    that looks vehicle-like), and only if that first HEARTBEAT wasn't, say,
+    MAVProxy's own GCS-type heartbeat on the same link. target_component is
+    NEVER auto-populated by pymavlink — it silently stays 0 forever unless we
+    set it explicitly. Confirmed on the bench: a one-shot wait_heartbeat() at
+    connect time left target_system=0, target_component=0, so our PX4 param
+    writes were being addressed to component 0 the whole time — PARAM_SET
+    apparently doesn't get the same broadcast tolerance PX4 gives COMMAND_LONG
+    (which is why arm/mode commands worked despite this bug and param writes
+    didn't). Loop until we see a HEARTBEAT specifically from the autopilot
+    component (compid 1), then set target_system/target_component from it."""
+    from pymavlink import mavutil
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        msg = conn.recv_match(type='HEARTBEAT', blocking=True, timeout=deadline - time.time())
+        if msg and msg.get_srcComponent() == mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1:
+            conn.target_system = msg.get_srcSystem()
+            conn.target_component = msg.get_srcComponent()
+            return True
+    return False
+
+
 def connect(url="udpin:0.0.0.0:14551", fallback_url=None):
     """
     Connect to MAVProxy via UDP and start the telemetry reader thread.
@@ -208,9 +286,13 @@ def connect(url="udpin:0.0.0.0:14551", fallback_url=None):
     from pymavlink import mavutil
     try:
         _connection = mavutil.mavlink_connection(url)
-        _connection.wait_heartbeat(timeout=5)
+        if not _lock_onto_autopilot(_connection, timeout=15.0):
+            raise RuntimeError("no HEARTBEAT from the autopilot component (compid 1)")
+        if _autopilot == "px4":
+            _apply_px4_fixed_params()
         _enabled = True
         _request_attitude_stream()
+        set_guided_mode()
         print(f"[MAVLink] Connected via MAVProxy ({url}), heartbeat received.")
     except Exception as e:
         print(f"[WARNING] MAVLink primary connection failed: {e}")
@@ -266,11 +348,16 @@ def _telemetry_reader():
             time.sleep(0.5)
             continue
         try:
-            msg = _connection.recv_match(type=['ATTITUDE', 'STATUSTEXT', 'COMMAND_ACK', 'HEARTBEAT'],
+            msg = _connection.recv_match(type=['ATTITUDE', 'STATUSTEXT', 'COMMAND_ACK', 'HEARTBEAT', 'PARAM_VALUE'],
                                           blocking=True, timeout=1.0)
             if msg is None:
                 continue
-            if msg.get_type() == 'STATUSTEXT':
+            if msg.get_type() == 'PARAM_VALUE':
+                name = msg.param_id.rstrip('\x00')
+                if name in _PX4_FIXED_PARAMS:
+                    value = struct.unpack('<i', struct.pack('<f', msg.param_value))[0]
+                    print(f"[FC] PARAM_VALUE {name} = {value}")
+            elif msg.get_type() == 'STATUSTEXT':
                 print(f"[FC] {msg.text.strip()}")
             elif msg.get_type() == 'COMMAND_ACK':
                 result = mav_result_names.get(msg.result)
@@ -335,9 +422,9 @@ def disarm():
     if not _enabled:
         return
     from pymavlink import mavutil
-    # Flask is threaded — arm_and_set_guided() and disarm() share this lock so
-    # an overlapping call (e.g. a stale UI auto-disarm racing a real launch
-    # click) can't interleave mode/arm commands with this one.
+    # Flask is threaded — set_guided_mode()/arm() and disarm() share this lock
+    # so an overlapping call (e.g. a stale UI auto-disarm racing a real
+    # launch click) can't interleave mode/arm commands with this one.
     with _launch_lock:
         try:
             armed = _is_armed()
@@ -352,7 +439,7 @@ def disarm():
                 base_mode = (mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
                              | mavutil.mavlink.MAV_MODE_FLAG_STABILIZE_ENABLED
                              | mavutil.mavlink.MAV_MODE_FLAG_MANUAL_INPUT_ENABLED)
-                custom_mode = _PX4_MAIN_MODE_MANUAL << 16
+                custom_mode = _PX4_MAIN_MODE_MANUAL  # raw, no <<16 — see set_guided_mode()
             else:
                 base_mode = mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
                 custom_mode = 0  # ArduPlane MANUAL — most permissive for disarm
@@ -391,10 +478,15 @@ def disarm():
             print(f"[MAVLink] disarm error: {e}")
 
 
-def arm_and_set_guided():
-    """Set GUIDED (ArduPilot) or OFFBOARD (PX4) mode and arm the FC."""
+def set_guided_mode():
+    """Switch into GUIDED (ArduPilot) or OFFBOARD (PX4) mode, without arming.
+    Called automatically at the end of connect() so the FC is already in the
+    right mode well before Launch is pressed — arm() then only has to arm.
+    Relies on the main loop streaming a neutral-hold attitude target
+    continuously from connect time onward (not gated on "launched"), since
+    PX4 exits OFFBOARD if the setpoint stream stops even briefly."""
     if not _enabled:
-        print("[MAVLink] Not connected — skipping arm/GUIDED")
+        print("[MAVLink] Not connected — skipping mode switch")
         return
     from pymavlink import mavutil
     with _launch_lock:
@@ -410,23 +502,62 @@ def arm_and_set_guided():
                              | mavutil.mavlink.MAV_MODE_FLAG_AUTO_ENABLED
                              | mavutil.mavlink.MAV_MODE_FLAG_STABILIZE_ENABLED
                              | mavutil.mavlink.MAV_MODE_FLAG_GUIDED_ENABLED)
-                custom_mode = _PX4_MAIN_MODE_OFFBOARD << 16
+                # NOTE: no <<16 shift here. That packed encoding (main_mode in
+                # bits 16-23) is only for the 32-bit custom_mode field of
+                # HEARTBEAT / the legacy SET_MODE message. MAV_CMD_DO_SET_MODE
+                # sent via COMMAND_LONG is different: PX4's mavlink_receiver
+                # forwards param2 straight through, and Commander reads it as
+                # (uint8_t)param2 — the raw main_mode number, unshifted. A
+                # shifted value here truncates to 0 on the FC side and matches
+                # no valid mode, so the switch silently never takes effect.
+                custom_mode = _PX4_MAIN_MODE_OFFBOARD
                 mode_label = "OFFBOARD"
+                # A single DO_SET_MODE can land while the link is congested
+                # (e.g. MAVProxy's post-connect param bulk fetch) right when
+                # PX4 checks setpoint recency, and get silently ignored with
+                # no STATUSTEXT. Retry a few times, interleaved with attitude
+                # targets, so the setpoint stream stays fresh across attempts.
+                for attempt in range(5):
+                    _connection.mav.command_long_send(
+                        _connection.target_system,
+                        _connection.target_component,
+                        mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+                        0,
+                        base_mode,
+                        custom_mode,
+                        0, 0, 0, 0, 0
+                    )
+                    print(f"[MAVLink] {mode_label} mode command sent (attempt {attempt + 1}/5)")
+                    send_attitude_target(0.0, 0.0, thrust=0.0)
+                    time.sleep(0.2)
             else:
                 base_mode = mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
                 custom_mode = 15  # ArduPlane GUIDED
                 mode_label = "GUIDED"
-            _connection.mav.command_long_send(
-                _connection.target_system,
-                _connection.target_component,
-                mavutil.mavlink.MAV_CMD_DO_SET_MODE,
-                0,
-                base_mode,
-                custom_mode,
-                0, 0, 0, 0, 0
-            )
-            print(f"[MAVLink] {mode_label} mode command sent")
-            time.sleep(0.5)
+                _connection.mav.command_long_send(
+                    _connection.target_system,
+                    _connection.target_component,
+                    mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+                    0,
+                    base_mode,
+                    custom_mode,
+                    0, 0, 0, 0, 0
+                )
+                print(f"[MAVLink] {mode_label} mode command sent")
+        except Exception as e:
+            print(f"[MAVLink] set_guided_mode error: {e}")
+
+
+def arm():
+    """Arm the FC. Assumes GUIDED/OFFBOARD mode was already set by
+    set_guided_mode() (called automatically at connect time) — this now
+    only arms, so Launch doesn't have to wait on the mode-switch retries."""
+    if not _enabled:
+        print("[MAVLink] Not connected — skipping arm")
+        return
+    from pymavlink import mavutil
+    with _launch_lock:
+        try:
             _connection.mav.command_long_send(
                 _connection.target_system,
                 _connection.target_component,
@@ -440,7 +571,7 @@ def arm_and_set_guided():
             global _launched
             _launched = True
         except Exception as e:
-            print(f"[MAVLink] arm_and_set_guided error: {e}")
+            print(f"[MAVLink] arm error: {e}")
 
 
 def send_attitude_target(pitch_err, yaw_err, roll_err=0.0, thrust=0.5):
@@ -464,10 +595,28 @@ def send_attitude_target(pitch_err, yaw_err, roll_err=0.0, thrust=0.5):
         responding to the body-frame camera error. So on ArduPilot yaw is
         sent RAW (just the clamped camera error, never composed).
 
-    PX4's OFFBOARD attitude controller has no such split: all three axes of
-    the quaternion are a normal absolute attitude setpoint, so on PX4 yaw is
-    composed onto current heading exactly like roll/pitch (NOT verified on
-    the bench yet — confirm before flight).
+    PX4 (fixed-wing, no ailerons — yaw done via dedicated rudder surfaces,
+    CA_SV_CS0/CS2 TRQ_Y=1.0 per mav.parm): tried yaw as an absolute
+    attitude-quaternion angle, then as an explicit body_yaw_rate mixed
+    alongside the quaternion for roll/pitch — neither moved the rudder.
+    Confirmed via QGC MAVLink Inspector: the ATTITUDE_TARGET echo showed
+    our commanded yaw_rate replaced by a tiny (~0.01-0.03 rad/s) value
+    that tracked roll (near 0, since roll is never commanded), not our
+    input. That means PX4's FW_ATT_CONTROL, whenever the attitude
+    quaternion is not ignored, owns the rate setpoint for ALL axes
+    (deriving yaw's from bank-angle turn coordination) and silently
+    overwrites/ignores any per-axis body rate we also provide — there is
+    no real per-axis attitude/rate mix on PX4 FW.
+    So PX4 now runs in full RATE mode instead: type_mask sets
+    ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE, so the quaternion (q) is
+    unused (current attitude sent as a harmless placeholder) and ALL
+    THREE axes are driven as explicit body rate setpoints, computed here
+    as a simple proportional mapping (clamped angle error, in rad, used
+    directly as rad/s) — same convention already used for yaw. This
+    bypasses FW_ATT_CONTROL's angle loop (and its turn-coordination yaw
+    logic) entirely, going straight to the rate controller/CA allocation
+    for roll, pitch AND yaw. ArduPlane is untouched — still absolute
+    quaternion for roll/pitch, raw yaw (see above), proven working.
 
     Skips the send if the cached current-attitude reading is stale (older
     than MAX_ATTITUDE_AGE) rather than command a wrong roll/pitch target.
@@ -490,11 +639,30 @@ def send_attitude_target(pitch_err, yaw_err, roll_err=0.0, thrust=0.5):
     try:
         q_current = QuaternionBase([current[0], current[1], current[2]])
         if _autopilot == "px4":
-            # PX4: compose all three axes onto current attitude -> absolute
-            # attitude setpoint (see docstring).
-            q_delta = QuaternionBase([roll, pitch, yaw])
-            roll_target, pitch_target, yaw_target = (q_current * q_delta).euler
-            q = QuaternionBase([roll_target, pitch_target, yaw_target])
+            # Full rate mode: quaternion is ignored, all three axes are
+            # explicit body rate setpoints (rad/s), bypassing FW_ATT_CONTROL's
+            # angle loop entirely (see docstring).
+            q = q_current  # placeholder; ATTITUDE_IGNORE bit means it's unused
+            body_roll_rate, body_pitch_rate, body_yaw_rate = roll, pitch, yaw
+            # NOTE: bit 6 (0b01000000=64) is ATTITUDE_TARGET_TYPEMASK_THRUST_IGNORE,
+            # NOT ignore-attitude — that mistake sent q=current (zero error, no
+            # driven pitch/roll signal) and zeroed thrust (confirmed via QGC
+            # showing thrust=0). ignore_attitude is bit 7 (0b10000000=128).
+            type_mask = 0b10000000  # ignore attitude only -> use body rates + thrust
+            _connection.mav.set_attitude_target_send(
+                int(time.time() * 1000) & 0xFFFFFFFF,
+                _connection.target_system,
+                _connection.target_component,
+                type_mask,
+                q,
+                body_roll_rate, body_pitch_rate, body_yaw_rate,
+                thrust
+            )
+            if DEBUG:
+                print(f"[MAVLink] SET_ATTITUDE_TARGET (rate mode) age={age*1000:.0f}ms "
+                      f"sent_rates=(roll={math.degrees(body_roll_rate):+.2f}°/s,"
+                      f"pitch={math.degrees(body_pitch_rate):+.2f}°/s,"
+                      f"yaw={math.degrees(body_yaw_rate):+.2f}°/s) thrust={thrust:.2f}")
         else:
             # ArduPlane: compose only roll/pitch -> absolute nav_roll_cd/
             # nav_pitch_cd target. Yaw is deliberately left OUT of this
@@ -503,22 +671,22 @@ def send_attitude_target(pitch_err, yaw_err, roll_err=0.0, thrust=0.5):
             roll_target, pitch_target, _ = (q_current * q_delta_rp).euler
             yaw_target = yaw
             q = QuaternionBase([roll_target, pitch_target, yaw_target])
-        _connection.mav.set_attitude_target_send(
-            int(time.time() * 1000) & 0xFFFFFFFF,
-            _connection.target_system,
-            _connection.target_component,
-            0b00000111,        # ignore body rates, use quaternion + thrust
-            q,
-            0.0, 0.0, 0.0,     # body roll/pitch/yaw rates (ignored)
-            thrust
-        )
-        if DEBUG:
-            print(f"[MAVLink] SET_ATTITUDE_TARGET composed_on=({math.degrees(current[0]):+.1f},"
-                  f"{math.degrees(current[1]):+.1f},{math.degrees(current[2]):+.1f})° "
-                  f"age={age*1000:.0f}ms err=({math.degrees(roll):+.2f},{math.degrees(pitch):+.2f},"
-                  f"{math.degrees(yaw):+.2f})° "
-                  f"sent_rp=({math.degrees(roll_target):+.1f},{math.degrees(pitch_target):+.1f})° "
-                  f"sent_yaw_{'composed' if _autopilot == 'px4' else 'raw'}="
-                  f"{math.degrees(yaw_target):+.2f}° thrust={thrust:.2f}")
+            type_mask = 0b00000111  # ignore all body rates, use quaternion + thrust
+            _connection.mav.set_attitude_target_send(
+                int(time.time() * 1000) & 0xFFFFFFFF,
+                _connection.target_system,
+                _connection.target_component,
+                type_mask,
+                q,
+                0.0, 0.0, 0.0,
+                thrust
+            )
+            if DEBUG:
+                print(f"[MAVLink] SET_ATTITUDE_TARGET composed_on=({math.degrees(current[0]):+.1f},"
+                      f"{math.degrees(current[1]):+.1f},{math.degrees(current[2]):+.1f})° "
+                      f"age={age*1000:.0f}ms err=({math.degrees(roll):+.2f},{math.degrees(pitch):+.2f},"
+                      f"{math.degrees(yaw):+.2f})° "
+                      f"sent_rp=({math.degrees(roll_target):+.1f},{math.degrees(pitch_target):+.1f})° "
+                      f"sent_yaw_raw={math.degrees(yaw_target):+.2f}° thrust={thrust:.2f}")
     except Exception as e:
         print(f"[MAVLink] set_attitude_target failed: {e}")

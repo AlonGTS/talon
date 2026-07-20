@@ -480,7 +480,7 @@ app = flask_app.create_app(
     state, create_csrt_tracker,
     cycle_main_fn      = _cycle_main if args.mode == 'live' else None,
     cycle_lores_fn     = _cycle_lores,
-    launch_fn          = lambda v=None: mavlink_client.arm_and_set_guided() if (v is None or v) else mavlink_client.disarm(),
+    launch_fn          = lambda v=None: mavlink_client.arm() if (v is None or v) else mavlink_client.disarm(),
     get_launch_state_fn= lambda: mavlink_client._launched,
 )
 
@@ -726,10 +726,12 @@ while True:
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
     # PX4's OFFBOARD mode auto-exits (COM_OF_LOSS_T) if it stops receiving
-    # setpoints, even briefly — so once launched we must keep the stream
-    # alive every frame, not just while a target is actively tracked.
+    # setpoints, even briefly — mode is now set right after connect (see
+    # mavlink_client.set_guided_mode()), well before Launch/arm, so the
+    # stream must run continuously from connect time onward too, not just
+    # once launched, or OFFBOARD would drop before anyone presses Launch.
     # Harmless on ArduPlane too: a zero-error target just holds/centers.
-    if mavlink_client._launched and not _attitude_sent:
+    if not _attitude_sent:
         mavlink_client.send_attitude_target(0.0, 0.0)
 
     # Write to file if in record mode
