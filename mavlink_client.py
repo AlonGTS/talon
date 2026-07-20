@@ -51,6 +51,15 @@ def set_autopilot(kind: str):
 # allowed to rotate the target away from the FC's current attitude.
 MAX_ANGLE = math.radians(25)
 
+# PX4 rate-mode roll self-level (see send_attitude_target docstring): with
+# FW_ATT_CONTROL's angle loop bypassed, roll has no restoring force unless we
+# close that loop ourselves. ROLL_LEVEL_KP converts current bank angle error
+# (rad) into a commanded roll rate (rad/s); value matches this airframe's own
+# FW_R_TC=0.4s (mav.parm) so the outer loop behaves like PX4's own angle->rate
+# gain (Kp = 1/time_constant). MAX_ROLL_RATE matches FW_R_RMAX (mav.parm).
+ROLL_LEVEL_KP  = 1.0 / 0.4
+MAX_ROLL_RATE  = math.radians(70)
+
 # ArduPlane's GUIDED SET_ATTITUDE_TARGET takes an absolute, horizon-referenced
 # roll/pitch/yaw demand (confirmed on the bench), so "hold current attitude"
 # requires composing the camera error onto the FC's latest reported attitude
@@ -610,13 +619,22 @@ def send_attitude_target(pitch_err, yaw_err, roll_err=0.0, thrust=0.5):
     So PX4 now runs in full RATE mode instead: type_mask sets
     ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE, so the quaternion (q) is
     unused (current attitude sent as a harmless placeholder) and ALL
-    THREE axes are driven as explicit body rate setpoints, computed here
-    as a simple proportional mapping (clamped angle error, in rad, used
-    directly as rad/s) — same convention already used for yaw. This
-    bypasses FW_ATT_CONTROL's angle loop (and its turn-coordination yaw
-    logic) entirely, going straight to the rate controller/CA allocation
-    for roll, pitch AND yaw. ArduPlane is untouched — still absolute
+    THREE axes are driven as explicit body rate setpoints. This bypasses
+    FW_ATT_CONTROL's angle loop (and its turn-coordination yaw logic)
+    entirely, going straight to the rate controller/CA allocation for
+    roll, pitch AND yaw. ArduPlane is untouched — still absolute
     quaternion for roll/pitch, raw yaw (see above), proven working.
+
+    Bypassing the angle loop means roll has no restoring force of its own
+    any more — a rate setpoint only says "stop rotating", not "return to
+    level". So roll_rate is NOT the raw clamped error like pitch/yaw; it's
+    closed here with our own P controller against the FC's current roll
+    (ROLL_LEVEL_KP, clamped to MAX_ROLL_RATE) so the aircraft still
+    self-levels when roll_err is 0 (its only value today — tracker-so.py
+    never passes a nonzero roll_err). pitch/yaw keep the simple mapping
+    (clamped angle error, in rad, used directly as rad/s rate) — PX4's
+    rate controller still closes those loops itself once given a rate
+    target, so no separate outer loop is needed there.
 
     Skips the send if the cached current-attitude reading is stale (older
     than MAX_ATTITUDE_AGE) rather than command a wrong roll/pitch target.
@@ -643,7 +661,12 @@ def send_attitude_target(pitch_err, yaw_err, roll_err=0.0, thrust=0.5):
             # explicit body rate setpoints (rad/s), bypassing FW_ATT_CONTROL's
             # angle loop entirely (see docstring).
             q = q_current  # placeholder; ATTITUDE_IGNORE bit means it's unused
-            body_roll_rate, body_pitch_rate, body_yaw_rate = roll, pitch, yaw
+            # Roll: P controller against current bank angle (self-level),
+            # since a raw rate setpoint alone has no restoring force (see
+            # docstring). Pitch/yaw: unchanged direct angle-error-as-rate.
+            roll_rate_cmd = ROLL_LEVEL_KP * (roll - current[0])
+            body_roll_rate = max(-MAX_ROLL_RATE, min(MAX_ROLL_RATE, roll_rate_cmd))
+            body_pitch_rate, body_yaw_rate = pitch, yaw
             # NOTE: bit 6 (0b01000000=64) is ATTITUDE_TARGET_TYPEMASK_THRUST_IGNORE,
             # NOT ignore-attitude — that mistake sent q=current (zero error, no
             # driven pitch/roll signal) and zeroed thrust (confirmed via QGC
