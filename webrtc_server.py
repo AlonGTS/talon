@@ -11,6 +11,7 @@ Usage from tracker.py:
     fb.put(output_frame)
 """
 import asyncio
+import ipaddress
 import time
 from fractions import Fraction
 from threading import Condition, Lock
@@ -19,6 +20,25 @@ from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack, RTCRtpSender
 from aiortc.mediastreams import MediaStreamError
 from av import VideoFrame
+
+import aioice.ice as _aioice_ice
+
+# Tailscale (and other CGNAT-range VPN) addresses show up as extra ICE host
+# candidates on multi-homed boxes. GCS clients connect over plain LAN, so an
+# unreachable tailnet-only candidate just wastes ICE negotiation time / can
+# get wrongly preferred over the real LAN candidate. Drop the whole
+# 100.64.0.0/10 CGNAT range (which Tailscale uses) before candidates are
+# gathered.
+_TAILSCALE_RANGE = ipaddress.ip_network("100.64.0.0/10")
+_orig_get_host_addresses = _aioice_ice.get_host_addresses
+
+
+def _filtered_get_host_addresses(use_ipv4, use_ipv6):
+    addresses = _orig_get_host_addresses(use_ipv4, use_ipv6)
+    return [a for a in addresses if ipaddress.ip_address(a) not in _TAILSCALE_RANGE]
+
+
+_aioice_ice.get_host_addresses = _filtered_get_host_addresses
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +166,15 @@ WEBRTC_HTML = """
       .hint { color:#666; font-size:12px; text-align:center; }
 
       .rail { display:flex; flex-direction:column; align-items:stretch; gap:12px; }
+      .fc-status { display:flex; flex-direction:column; gap:6px; margin-bottom:4px; }
+      .pill {
+        padding:8px 12px; border-radius:8px; font-size:14px; font-weight:bold;
+        text-align:center; color:white; box-shadow:0 2px 6px rgba(0,0,0,.15);
+      }
+      .pill-unknown { background:#9E9E9E; }
+      .pill-armed   { background:#f44336; }
+      .pill-disarmed{ background:#4CAF50; }
+      .pill-mode    { background:#2196F3; }
       .btn { padding:12px 16px; border:0; border-radius:10px; font-size:16px; cursor:pointer; color:white; box-shadow:0 2px 6px rgba(0,0,0,.15); }
       .btn.secondary { background:#607D8B; }
       .btn.go { background:#4CAF50; }
@@ -176,6 +205,10 @@ WEBRTC_HTML = """
       </div>
 
       <div class="rail">
+        <div id="fcStatus" class="fc-status">
+          <span id="fcArmed" class="pill pill-unknown">UNKNOWN</span>
+          <span id="fcMode" class="pill pill-unknown">MODE: —</span>
+        </div>
         <button id="startBtn" class="btn secondary">Connect</button>
         <button class="btn launch" onclick="sendLaunch()">Launch (L)</button>
         <button class="btn go"   onclick="sendCmd('r')">Reset (R)</button>
@@ -248,11 +281,28 @@ WEBRTC_HTML = """
           btn.style.background = '';
         }
       }
-      // Sync launch button with server state on page load
-      fetch('http://' + location.hostname + ':5000/status')
-        .then(r => r.json())
-        .then(d => setLaunchBtn(d.launched))
-        .catch(() => {});
+      // Poll server for ground-truth FC state (from HEARTBEAT, not requested state)
+      const fcArmedEl = document.getElementById('fcArmed');
+      const fcModeEl  = document.getElementById('fcMode');
+      function pollStatus(){
+        fetch('http://' + location.hostname + ':5000/status')
+          .then(r => r.json())
+          .then(d => {
+            setLaunchBtn(d.launched);
+            if (d.armed === null || d.armed === undefined) {
+              fcArmedEl.textContent = 'ARMED: UNKNOWN';
+              fcArmedEl.className = 'pill pill-unknown';
+            } else {
+              fcArmedEl.textContent = d.armed ? 'ARMED' : 'DISARMED';
+              fcArmedEl.className = d.armed ? 'pill pill-armed' : 'pill pill-disarmed';
+            }
+            fcModeEl.textContent = 'MODE: ' + (d.mode || '—');
+            fcModeEl.className = 'pill ' + (d.mode ? 'pill-mode' : 'pill-unknown');
+          })
+          .catch(() => {});
+      }
+      pollStatus();
+      setInterval(pollStatus, 1000);
       async function sendLaunch(){
         if (launchPending) return;
         launchPending = true;

@@ -47,12 +47,13 @@ gcs_jpeg_quality = 40     # was 60 — lower = smaller frames (~12 KB vs ~35 KB)
 gcs_stream_width = 640  # was 640 — scale before encode (~3 Mbps vs ~8 Mbps @ 30fps)
 
 # Video transport: "jpeg_udp" = current JPEG-over-UDP for gcs.py
-#                  "webrtc"   = H.264 WebRTC served at http://<pi>:8080
-video_mode           = "webrtc"
+#                  "WebRTC"   = H.264 WebRTC served at http://<pi>:8080
+video_mode           = "WebRTC"
 webrtc_bitrate_kbps  = 0   # 0 = unconstrained; set e.g. 800 for narrow RF links
 
 [network.wlan0]
-#tailscale bind_ip = "100.81.204.7"
+#tailscale 
+#bind_ip = "100.81.204.7"
 bind_ip = "192.168.1.34"
 # gcs_ip no longer needed — Pi learns GCS IP dynamically from heartbeat packets
 
@@ -64,7 +65,7 @@ gcs_ip  = "192.168.10.8"
 autopilot     = "px4"      # "ardupilot" (Matek F405 Wing / ArduPlane) or "px4" (Pixhawk6c mini / PX4)
 pixhawk_port  = "/dev/ttyACM0"   # Matek F405 Wing — check with: ls /dev/ttyACM* /dev/ttyUSB*
 pixhawk_baud  = 115200
-gcs_ip        = "192.168.10.100"    # legacy field (kept for reference)
+gcs_ip        = "192.168.1.30"    # legacy field (kept for reference)
 gcs_port      = 14550
 local_port    = 14551
 # Dedicated unicast outputs — MAVProxy sends a copy to each IP:gcs_port

@@ -169,7 +169,7 @@ LORES_SIZES   = [tuple(s) for s in _cfg["camera"]["lores_sizes"]]
 _net_iface  = _cfg["network"]["interface"]
 _net        = _cfg["network"][_net_iface]
 BIND_IP     = _net["bind_ip"]
-_VIDEO_MODE = _cfg["network"].get("video_mode", "jpeg_udp")
+_VIDEO_MODE = _cfg["network"].get("video_mode", "jpeg_udp").lower()
 GCS_IP      = None   # learned dynamically from GCS heartbeat packets
 print(f"[NET] interface={_net_iface}  bind={BIND_IP}  gcs=<waiting for GCS hello>")
 
@@ -490,6 +490,7 @@ app = flask_app.create_app(
     cycle_lores_fn     = _cycle_lores,
     launch_fn          = _launch_fn,
     get_launch_state_fn= lambda: mavlink_client._launched,
+    get_fc_state_fn    = lambda: (mavlink_client._last_hb_armed, mavlink_client._last_hb_mode),
 )
 
 # === Launch Flask in separate thread ===
