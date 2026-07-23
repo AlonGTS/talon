@@ -475,12 +475,20 @@ def _cycle_lores(delta):
     print(f"[TRACK] LORES → {state.lores_size[0]}x{state.lores_size[1]}")
 
 
+def _launch_fn(v=None):
+    if v is None or v:
+        time.sleep(1)  # give the FC a beat to settle into GUIDED/OFFBOARD before arming
+        mavlink_client.arm()
+    else:
+        mavlink_client.disarm()
+
+
 import flask_app
 app = flask_app.create_app(
     state, create_csrt_tracker,
     cycle_main_fn      = _cycle_main if args.mode == 'live' else None,
     cycle_lores_fn     = _cycle_lores,
-    launch_fn          = lambda v=None: mavlink_client.arm() if (v is None or v) else mavlink_client.disarm(),
+    launch_fn          = _launch_fn,
     get_launch_state_fn= lambda: mavlink_client._launched,
 )
 
