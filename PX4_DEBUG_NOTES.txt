@@ -1,0 +1,386 @@
+TALON — PX4 OFFBOARD DEBUGGING SESSION NOTES
+=============================================
+Written 2026-07-16, end of session, for continuation next time.
+
+GOAL
+----
+Talon (this repo) now supports both ArduPlane and PX4 autopilots.
+Set via config.toml -> [mavlink] autopilot = "ardupilot" | "px4".
+mavlink_client.py branches its mode-switch / arm / attitude-target
+encoding based on this. ArduPlane path is proven working (bench +
+prior flights). PX4 path is NEW and still not working end-to-end.
+
+CURRENT SYMPTOM
+----------------
+On PX4 (Pixhawk6c mini bench setup): pressing Launch arms the vehicle
+successfully, but flight mode never actually leaves ACRO, even though
+our MAV_CMD_DO_SET_MODE(OFFBOARD) command gets MAV_RESULT_ACCEPTED.
+Because ACRO doesn't consume SET_ATTITUDE_TARGET at all, none of our
+MAVLink commands reach the control surfaces -> servos never move.
+
+Confirmed via /tmp/talon.log (see "how to capture logs" below):
+    [FC] HEARTBEAT armed=False mode=ACRO
+    ... DO_SET_MODE -> MAV_RESULT_ACCEPTED (x2) ...
+    ... ARM -> MAV_RESULT_ACCEPTED ...
+    [FC] HEARTBEAT armed=True mode=ACRO      <- mode never changed!
+
+LEADING HYPOTHESIS (not yet confirmed)
+---------------------------------------
+No GPS fix. Evidence:
+  - MAV_CMD_GET_HOME_POSITION -> MAV_RESULT_DENIED repeats constantly
+    in the log, from before Launch is even pressed. PX4 denies this
+    when it has never gotten a valid global position.
+  - mav.parm: EKF2_GPS_CTRL=7, EKF2_GPS_CHECK=2047 (full GPS gating) —
+    GPS is the configured position source with all quality checks on.
+  - Ruled out: RC override (COM_RC_OVERRIDE=1) — user confirmed NO RC
+    transmitter is connected at all during these bench tests, so RC
+    can't be what's forcing mode back to ACRO.
+  - Many PX4 versions gate ANY Offboard-mode entry on having a valid
+    position estimate, even for pure attitude+thrust setpoints that
+    don't themselves need position. Testing indoors on the bench with
+    no GPS lock would explain the silent (no STATUSTEXT) failure to
+    transition, while DO_SET_MODE still ACKs "accepted" (that ACK only
+    means "command parsed", not "transition succeeded" — learned this
+    the hard way this session).
+
+NEXT STEPS TO TRY
+------------------
+1. Check QGroundControl's GPS status indicator (top bar) — confirm
+   0 satellites / no fix / "position not valid".
+2. If no GPS fix: either (a) test outdoors / wherever GPS can lock,
+   or (b) reconfigure EKF2 to not require GPS for position (e.g. a
+   non-GPS height/position reference) if bench-only testing is a hard
+   requirement — this is a PX4 param/EKF config change, not a code fix.
+3. Once GPS/position is valid (or EKF reconfigured), retest Launch and
+   check the HEARTBEAT log lines again — mode should show OFFBOARD,
+   not ACRO, right after arming.
+4. If mode STILL doesn't switch even with valid position: try manually
+   selecting "Offboard" from QGC's own mode dropdown (with the script's
+   attitude-target stream running) to isolate whether it's a vehicle
+   precondition (QGC also can't force it) vs. something specific to
+   our DO_SET_MODE command encoding.
+
+HOW TO CAPTURE LOGS FOR NEXT SESSION
+--------------------------------------
+The desktop shortcut ~/Desktop/talon-live.desktop was edited to tee
+output to a file:
+    python3 tracker-so.py --mode live 2>&1 | tee /tmp/talon.log
+NOTE: tee overwrites /tmp/talon.log fresh on every run (no -a), so
+grab/copy it before starting another run if you want to keep it.
+
+Useful greps after a test run:
+    grep -nE "HEARTBEAT|OFFBOARD|DO_SET_MODE|ARM command|POST /launch" /tmp/talon.log
+    grep -niE "reject|offboard|prearm|preflight|denied|fail" /tmp/talon.log
+    grep -nE "ACRO|Mode |HEARTBEAT|mode=" /tmp/talon.log
+
+CODE CHANGES MADE THIS SESSION (all committed to master)
+-----------------------------------------------------------
+1. 323434a — Keep OFFBOARD setpoint stream alive continuously.
+   Was: tracker-so.py only called mavlink_client.send_attitude_target()
+   while a target was actively tracked with good-enough quality.
+   PX4 auto-exits OFFBOARD (COM_OF_LOSS_T=1s) if it stops receiving
+   setpoints even briefly, which was causing random drops to Land
+   whenever tracking was lost/not yet acquired. Fixed: main loop now
+   sends a neutral hold target every frame whenever launched, regardless
+   of tracking state. Also wrapped arm_and_set_guided() in try/except
+   (it had none — could fail silently) and added COMMAND_ACK logging.
+
+2. 2af2caa — Log actual FC mode/armed state from HEARTBEAT, not just
+   command ACKs. DO_SET_MODE's COMMAND_ACK only confirms PX4 parsed
+   the command, not that the transition was actually accepted by the
+   commander state machine.
+
+3. c0ec465 — Fix bug in the above: the new HEARTBEAT handler filtered
+   on both srcSystem AND srcComponent, but target_component wasn't
+   reliably matching, so the condition was always false and NO
+   HEARTBEAT logging ever fired. Fixed to filter on srcSystem only
+   (matching the already-proven-working pattern in _is_armed()).
+
+Also edited (not a repo file): ~/Desktop/talon-live.desktop, to tee
+console output to /tmp/talon.log for easier debugging (see above).
+
+KEY THINGS LEARNED ABOUT PX4 vs ARDUPLANE (for mavlink_client.py)
+---------------------------------------------------------------------
+- ArduPlane GUIDED: yaw sent RAW (rudder command), roll/pitch composed
+  onto current attitude. Proven working.
+- PX4 OFFBOARD: all three axes (roll/pitch/yaw) composed onto current
+  attitude as an absolute setpoint. Implemented but NOT yet verified
+  on the bench because mode never actually engages (see above) — once
+  OFFBOARD is confirmed sticking, still need to verify this composition
+  is correct in practice (thrust scaling, sign conventions, etc.)
+- PX4 custom_mode encoding: main_mode packed into bits 16-23 of the
+  32-bit custom_mode field (main_mode << 16). OFFBOARD = 6, MANUAL = 1.
+  This encoding itself is confirmed correct (MANUAL switch during
+  disarm() does visibly take effect).
+- MAV_RESULT_ACCEPTED on DO_SET_MODE ONLY means PX4 parsed the message.
+  It does NOT mean the mode transition was actually applied — PX4
+  validates that separately and can silently stay in the old mode.
+  Ground truth must come from HEARTBEAT.custom_mode / base_mode, not
+  the COMMAND_ACK.
+
+
+=============================================
+SESSION 2 — 2026-07-19 — STILL NOT WORKING, continue here next time
+=============================================
+
+STARTING POINT
+--------------
+Bench comms were flapping (connection "lost and gained repeatedly").
+Root cause was a bad USB cable — physical, not code. Confirmed fixed;
+not a software issue, no code changes needed for that part.
+
+After the cable fix: user disabled GPS arming requirement and got the
+FC to ARM successfully. But SET_ATTITUDE_TARGET commands appeared to
+have no effect on the vehicle ("not getting there or not responding").
+
+GROUND-TRUTH DIAGNOSIS (via live /tmp/talon.log, same method as
+Session 1 — HEARTBEAT, not ACKs)
+------------------------------------------------------------------
+1. SET_ATTITUDE_TARGET *was* being sent correctly and continuously —
+   confirmed in the log (composed roll/pitch/yaw, correct thrust,
+   fresh attitude age each frame). Not a sending bug.
+2. DO_SET_MODE(OFFBOARD) got MAV_RESULT_ACCEPTED (x2) as usual, but
+   HEARTBEAT stayed at mode=MANUAL after arming. Same "ACK != applied"
+   trap as Session 1, one level further now that arming works.
+   -> Since PX4 was never actually in OFFBOARD, it correctly ignored
+      all our SET_ATTITUDE_TARGET messages. That's the whole symptom.
+3. Hypothesis A: COM_RCL_EXCEPT (bitmask) was 0 on the FC. No RC
+   transmitter is ever connected on this rig, so PX4 treats "RC lost"
+   as true from boot, and by default that blocks/reverts OFFBOARD
+   entry unless Offboard's bit (bit 2, value 4) is in the exception
+   mask. Implemented as an automatic fixup (see CODE CHANGES) —
+   necessary but turned out NOT sufficient by itself (see next).
+4. Ran the live test again with the RC-exception fix applied. Mode
+   *still* never showed OFFBOARD. Worse: ~9 seconds after arming, PX4
+   forced the mode to LAND on its own (MAVProxy printed "LAND> Mode
+   LAND" — that's PX4 commanding this, not our code), then the
+   land-detector oscillated "Takeoff detected" / "Landing detected"
+   repeatedly for the rest of the run, and the FC eventually
+   auto-disarmed itself with no input from us.
+5. Hypothesis B (current leading theory): mav.parm has EKF2_GPS_CTRL=7
+   — the EKF is still configured to require/use GPS for its position
+   estimate, but there is no GPS receiver on this airframe at all, so
+   position never validates. This trips PX4's *generic* position-
+   invalid failsafe (separate from the offboard-entry precondition),
+   which force-switches to LAND regardless of flight mode. Per PX4
+   docs/GitHub issues, pure attitude+thrust offboard setpoints should
+   NOT themselves require a position estimate — this failsafe is a
+   different, broader safety check that fires whenever position is
+   invalid while armed, independent of what setpoints are being sent.
+   COM_ARM_WO_GPS=2 only relaxes *arming* pre-checks; it does not stop
+   this runtime failsafe.
+
+CODE CHANGES MADE THIS SESSION (in mavlink_client.py, NOT YET COMMITTED)
+--------------------------------------------------------------------------
+Added `_apply_px4_fixed_params()`, called from connect() whenever
+autopilot == "px4", right after wait_heartbeat() and before _enabled
+is set True. Blind-writes (PARAM_SET, no read-modify-write) three FC
+params every time the app connects:
+    COM_RCL_EXCEPT  = 4           (bit 2: exempt Offboard from RC-loss failsafe)
+    EKF2_GPS_CTRL   = 0           (stop the EKF waiting on GPS — none installed)
+    EKF2_NOAID_TOUT = 2000000000  (µs, ~33 min — extend dead-reckoning grace
+                                    period so position doesn't re-flag invalid
+                                    mid-flight)
+These live in the _PX4_FIXED_PARAMS dict near the top-ish of the PX4
+section of mavlink_client.py. Values are blind (not read-modify-write)
+deliberately — see next paragraph for why.
+
+ENGINEERING DETOUR (fixed, but worth knowing about)
+-----------------------------------------------------
+First attempt used read-modify-write (PARAM_REQUEST_READ) so as not to
+clobber any other bits/values already set. This reliably timed out:
+  a) Initial bug: the fixups ran AFTER _enabled was set True, so the
+     background _telemetry_reader thread immediately started
+     recv_match()-ing concurrently on the same connection. pymavlink's
+     recv_match discards any message not matching its own type filter
+     while scanning for one that does — so it was silently eating our
+     PARAM_VALUE replies before our read loop ever saw them. Fixed by
+     reordering (fixups now run before _enabled = True).
+  b) Even after that fix, reads still timed out (tried up to a 20s
+     budget per param). Cause: MAVProxy does its own full ~1150-param
+     bulk fetch immediately after connecting (visible as "Received N
+     parameters / Saved N+1 parameters to mav.parm" in MAVProxy's own
+     output when it happens), which floods/delays PARAM_VALUE traffic
+     on the same link for a while.
+  Resolution: gave up on reading current values first. This rig has a
+  single fixed role (no RC, no GPS, attitude-only offboard), so there
+  was nothing worth preserving — switched to blind param_set_send for
+  all three params. Added 'PARAM_VALUE' to _telemetry_reader's watched
+  message types so a confirmation prints asynchronously (`[FC]
+  PARAM_VALUE <name> = <value>`) if/when PX4 echoes one back, without
+  blocking connect() on it.
+
+RESULT: STILL NOT WORKING
+---------------------------
+User confirmed after this last change that it still doesn't work.
+IMPORTANT: this was NOT re-diagnosed with the ground-truth log method
+before the session ended — we do not yet know WHICH way it failed.
+Do not assume it's the same LAND-failsafe symptom; confirm fresh.
+Also unconfirmed: whether the FC actually applied the param writes at
+all — in the last run, no async "[FC] PARAM_VALUE ..." confirmation
+line was seen in the window checked, and mav.parm on disk was stale
+(hadn't been re-saved by MAVProxy's bulk fetch yet), so we have NO
+direct confirmation these three params actually took effect on the FC.
+
+NEXT STEPS FOR TOMORROW
+--------------------------
+1. Re-run the live test (see "HOW TO CAPTURE LOGS" below, still
+   accurate) and FIRST check, before touching Launch:
+     grep -nE "PARAM_VALUE|COM_RCL_EXCEPT|EKF2_GPS_CTRL|EKF2_NOAID_TOUT" /tmp/talon.log
+   to confirm the FC actually echoed back the new values. If nothing
+   shows up even after MAVProxy's bulk fetch finishes ("Received N
+   parameters..." line appears), the writes may not be reaching/being
+   accepted by the FC at all — investigate the MAV_PARAM_TYPE_INT32
+   encoding path (struct float/int reinterpret trick in
+   _apply_px4_fixed_params) against a QGC param list showing the
+   ACTUAL param type PX4 reports for these three (float vs int32) —
+   if PX4 reports a param as REAL32 instead of INT32 our reinterpret
+   trick would send garbage.
+2. STRONGLY SUSPECT: EKF2_* parameters often require an FC REBOOT to
+   take effect (the estimator may only read its aiding-source config
+   at startup, not live). We have NOT tried power-cycling the Pixhawk
+   after setting EKF2_GPS_CTRL/EKF2_NOAID_TOUT. Try: set the params,
+   reboot the FC (MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN or physically power
+   cycle), reconnect, THEN retest arm+launch. This is the most likely
+   reason "it didn't work" even if the writes themselves succeeded.
+3. If mode still won't reach/hold OFFBOARD after confirming the params
+   stuck + reboot: capture a fresh log and grep the same way as
+   Session 1's "NEXT STEPS" — specifically check for STATUSTEXT lines
+   (none have appeared in either session's logs so far, which is
+   itself odd — PX4 is silently rejecting/reverting without explaining
+   why over MAVLink STATUSTEXT; may need QGC's own connection, which
+   sometimes surfaces reject reasons in its UI/toast that don't always
+   get mirrored as STATUSTEXT, to see the actual rejection reason).
+4. If LAND-forcing failsafe recurs even with EKF2_GPS_CTRL=0: look at
+   COM_POS_FS_EPH / COM_POS_FS_EPV / COM_POS_FS_GAIN (position failsafe
+   threshold/gain — current bench value COM_POS_FS_EPH=5.0) — these
+   were NOT touched this session. Also worth checking whether EKF2 can
+   even produce a "valid" position via pure dead-reckoning with ZERO
+   aiding sources configured (GPS off, no optical flow/vision enabled)
+   — PX4 docs hint dead-reckoning needs at least one aiding source to
+   have been available at some point; with NONE ever configured, EKF2
+   might never set position "valid" at all regardless of EKF2_NOAID_TOUT,
+   in which case the fix needs a different angle (e.g. disabling
+   whatever hard-coded commander check reacts to global/local position
+   invalidity, rather than trying to make position "valid").
+5. Mundane check: confirm no leftover orphaned mavproxy processes from
+   a previous session are holding the serial port before testing (has
+   bitten us multiple times this session — `ps aux | grep mavproxy`,
+   kill by PID if `pkill -f mavproxy.py` doesn't work, it sometimes
+   doesn't for the --daemon-forked process).
+
+CURRENT REPO STATE
+---------------------
+mavlink_client.py has these changes in the working tree, UNCOMMITTED.
+mav.parm is also modified in the working tree (MAVProxy auto-saves it
+from live FC param fetches during testing — reflects the FC's state at
+last connect, including COM_RCL_EXCEPT=4 already picked up, but
+EKF2_GPS_CTRL/EKF2_NOAID_TOUT changes from this session were NOT yet
+reflected in the last on-disk mav.parm we checked — re-verify).
+
+
+=============================================
+SESSION 2 CONTINUED — same day, reboot check
+=============================================
+
+Went to do exactly what the "NEXT STEPS" above said: reboot the FC and
+check if the params stuck. Found two separate real bugs, then hit a
+hardware/firmware wall that stopped testing for today.
+
+BUG FOUND #1 (real, fixed): target_system/target_component were never
+being set
+-----------------------------------------------------------------------
+mavlink_client.connect() only ever called `_connection.wait_heartbeat()`
+and then immediately used `_connection.target_system` /
+`.target_component`. Turns out that's a classic pymavlink footgun:
+  - wait_heartbeat() does NOT set target_system/target_component itself.
+  - target_system is a property that returns pymavlink's own internal
+    self.sysid, which DOES auto-populate, but only as a side effect of
+    processing a HEARTBEAT that looks vehicle-like (pymavlink's
+    probably_vehicle_heartbeat() filter), and only from the FIRST such
+    HEARTBEAT ever seen on the connection. If the very first HEARTBEAT
+    wait_heartbeat() happens to catch is MAVProxy's own proxy heartbeat
+    (not the FC's), it still returns successfully (type filter matched)
+    but target_system stays 0.
+  - target_component is a property backed by param_sysid[1], which is
+    NEVER auto-populated from a heartbeat at all — it just stays 0
+    unless you explicitly assign `.target_component = ...` yourself.
+  Confirmed directly: a one-shot connect showed target_system=0,
+  target_component=0 despite "heartbeat received" printing fine.
+  This means our PARAM_SET/PARAM_REQUEST_READ messages (and possibly
+  other things) have likely been addressed to component 0 this whole
+  session. ARM / DO_SET_MODE / reboot commands still worked because
+  PX4's COMMAND_LONG handling is apparently broadcast-tolerant of
+  compid 0 — but PARAM_SET may not get the same tolerance, which would
+  explain "it didn't work" independent of any EKF2/reboot timing theory.
+
+  FIX (in mavlink_client.py, uncommitted): added `_lock_onto_autopilot()`,
+  which loops recv_match(type='HEARTBEAT') until it sees one specifically
+  from srcComponent == MAV_COMP_ID_AUTOPILOT1 (1), then explicitly sets
+  target_system/target_component from that message. connect() now calls
+  this instead of the bare wait_heartbeat(), with a 15s budget, and
+  raises (triggering the existing fallback path) if it never sees one.
+
+BUG/SYMPTOM #2 (NOT fixed, blocked further testing): FC stopped
+producing HEARTBEATs entirely
+-----------------------------------------------------------------------
+While verifying bug #1's fix, discovered the FC has gone silent over
+MAVLink on USB:
+  - A one-off diagnostic script listened on the MAVProxy UDP output for
+    20s: zero HEARTBEATs of any kind (not even MAVProxy's own).
+    MAVProxy's own log was stuck at "Waiting for heartbeat from
+    /dev/ttyACM1" the whole time.
+  - Bypassed MAVProxy entirely — direct pymavlink serial connection to
+    /dev/ttyACM1 @115200, wait_heartbeat(timeout=15) — still nothing.
+  - Ruled out port contention: `fuser /dev/ttyACM1` showed no process
+    holding it, and `ps aux` showed no leftover mavproxy/python procs.
+  - dmesg confirms the FC DID successfully reboot once this session
+    (~17:54): USB disconnect -> re-enumerated as "PX4 BL FMU v6C.x"
+    (bootloader, ~2s) -> disconnected again -> re-enumerated as normal
+    "PX4 FMU v6C.x" on ttyACM1. That's a clean reboot signature, and it
+    almost certainly came from our MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN
+    command in the FIRST reboot script attempt (sent before bug #1 was
+    fixed, so target was 0/0 — but like other COMMAND_LONG messages,
+    PX4 apparently accepted it anyway).
+  - No further USB disconnect/reconnect since ~17:54 — the ttyACM1
+    device node has stayed present and stable — but it produces no
+    MAVLink bytes at all as of ~18:52 (roughly an hour later, several
+    checks over that time).
+  This looks like a genuine FC-side fault/hang, not a Pi-side or
+  software issue: the USB CDC-ACM link is up (device enumerated,
+  stable) but nothing is being transmitted. Did NOT keep sending
+  further commands at it once this was confirmed — didn't want to
+  keep poking an already-unresponsive flight controller blind.
+
+NEXT STEPS FOR TOMORROW (supersedes previous "next steps" reboot item —
+that one is done, this is what it uncovered)
+--------------------------------------------------------------------------
+1. FIRST, before any more code/param work: physically power-cycle the
+   Pixhawk 6c mini (unplug USB / remove power fully, not just a soft
+   reboot command) and confirm with a plain direct-serial heartbeat
+   check (see the raw pymavlink snippet used above, or just `mavproxy.py
+   --master=/dev/ttyACM0 --baud=115200` by hand and watch for "online
+   system 1") that it's producing heartbeats again before running the
+   app. If it still won't produce heartbeats after a full power cycle,
+   this may need QGroundControl plugged in directly (richer diagnostics,
+   firmware/boot status, possibly a corrupted param or bad EKF2 config
+   from our blind writes causing a slow boot hang or crash — worth
+   trying a param reset / reflash as a last resort if QGC also can't
+   see it).
+2. Once heartbeats are confirmed flowing again: re-verify bug #1's fix
+   actually resolves target_system/target_component correctly (add a
+   quick print of `mavlink_client._connection.target_system` /
+   `.target_component` right after connect() — should show the FC's
+   real sysid, typically 1, and component 1, not 0/0).
+3. Then retest whether COM_RCL_EXCEPT / EKF2_GPS_CTRL / EKF2_NOAID_TOUT
+   actually land now that they're correctly addressed — check for the
+   async "[FC] PARAM_VALUE ..." confirmation lines, or inspect mav.parm
+   after MAVProxy's fresh bulk fetch completes.
+4. THEN — and only once params are confirmed applied — retest arm +
+   Launch and watch HEARTBEAT for whether mode reaches/holds OFFBOARD
+   without the LAND-failsafe forcing a mode change.
+5. Diagnostic scripts written this session (not part of the app, kept
+   in the session scratchpad, not this repo) if useful to recreate:
+   a "dump all HEARTBEATs seen with srcSystem/srcComponent/type" script
+   and a "connect + apply fixups + send reboot" script. Not saved in
+   the repo; rewrite if needed from the pattern described above.
