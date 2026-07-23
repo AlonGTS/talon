@@ -623,6 +623,7 @@ while True:
     # Tracking on LORES
     lores_frame = cv2.resize(frame, (lw, lh), interpolation=cv2.INTER_LINEAR)
     _attitude_sent = False
+    _thrust = 0.5 if mavlink_client._launched else 0.0
 
     # Detect tracker replacement from ANY init path (flask_app.py's remote
     # target-select, the local mouse callback, or the BB-clamp recreate below)
@@ -699,7 +700,7 @@ while True:
                 else:
                     # Only drive control surfaces when quality is sufficient
                     if tq >= TrackingQualityMonitor.SCORE_UNCERTAIN:
-                        mavlink_client.send_attitude_target(pitch_err, yaw_err)
+                        mavlink_client.send_attitude_target(pitch_err, yaw_err, thrust=_thrust)
                         _attitude_sent = True
 
                     # Box color encodes quality level
@@ -740,7 +741,7 @@ while True:
     # once launched, or OFFBOARD would drop before anyone presses Launch.
     # Harmless on ArduPlane too: a zero-error target just holds/centers.
     if not _attitude_sent:
-        mavlink_client.send_attitude_target(0.0, 0.0)
+        mavlink_client.send_attitude_target(0.0, 0.0, thrust=_thrust)
 
     # Write to file if in record mode
     if args.mode == 'record' and writer is not None:
